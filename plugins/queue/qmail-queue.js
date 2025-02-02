@@ -1,40 +1,39 @@
 // Queue to qmail-queue
 
-const childproc = require('child_process');
-const fs        = require('fs');
+const childproc = require('node:child_process');
+const fs        = require('node:fs');
 
 exports.register = function () {
-    const plugin = this;
 
-    plugin.queue_exec = plugin.config.get('qmail-queue.path') || '/var/qmail/bin/qmail-queue';
-    if (!fs.existsSync(plugin.queue_exec)) {
-        throw new Error(`Cannot find qmail-queue binary (${plugin.queue_exec})`);
+    this.queue_exec = this.config.get('qmail-queue.path') || '/var/qmail/bin/qmail-queue';
+    if (!fs.existsSync(this.queue_exec)) {
+        throw new Error(`Cannot find qmail-queue binary (${this.queue_exec})`);
     }
 
-    plugin.load_qmail_queue_ini();
+    this.load_qmail_queue_ini();
 
-    if (plugin.cfg.main.enable_outbound) {
-        plugin.register_hook('queue_outbound', 'hook_queue');
+    if (this.cfg.main.enable_outbound) {
+        this.register_hook('queue_outbound', 'hook_queue');
     }
 }
 
 exports.load_qmail_queue_ini = function () {
-    const plugin = this;
 
-    plugin.cfg = plugin.config.get('qmail-queue.ini', {
+    this.cfg = this.config.get('qmail-queue.ini', {
         booleans: [
             '+main.enable_outbound',
         ],
     },
     () => {
-        plugin.load_qmail_queue_ini();
+        this.load_qmail_queue_ini();
     });
 }
 
 exports.hook_queue = function (next, connection) {
     const plugin = this;
 
-    const txn = connection.transaction;
+    const txn = connection?.transaction;
+    if (!txn) return next();
 
     const q_wants = txn.notes.get('queue.wants');
     if (q_wants && q_wants !== 'qmail-queue') return next();
@@ -58,9 +57,8 @@ exports.hook_queue = function (next, connection) {
     connection.transaction.message_stream.pipe(qmail_queue.stdin, { line_endings: '\n' });
 
     qmail_queue.stdin.on('close', () => {
-        if (!connection.transaction) {
+        if (!connection?.transaction) {
             plugin.logerror("Transaction went away while delivering mail to qmail-queue");
-
             try {
                 qmail_queue.stdout.end();
             }

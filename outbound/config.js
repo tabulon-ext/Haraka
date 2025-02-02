@@ -3,13 +3,14 @@
 const config = require('haraka-config');
 const logger = require('../logger');
 
+exports.name = 'outbound/config'
+
 function load_config () {
     const cfg = exports.cfg = config.get('outbound.ini', {
         booleans: [
             '-disabled',
             '-always_split',
             '+enable_tls',
-            '-ipv6_enabled',
             '-local_mx_ok',
         ],
     }, () => {
@@ -35,15 +36,6 @@ function load_config () {
     if (!cfg.connect_timeout) {
         cfg.connect_timeout = 30;
     }
-    if (cfg.pool_timeout === undefined) {
-        cfg.pool_timeout = 50;
-    }
-    if (cfg.pool_concurrency_max === undefined) {
-        cfg.pool_concurrency_max = 10;
-    }
-    if (!cfg.ipv6_enabled && config.get('outbound.ipv6_enabled')) {
-        cfg.ipv6_enabled = true;
-    }
     if (!cfg.received_header) {
         cfg.received_header = config.get('outbound.received_header') || 'Haraka outbound';
     }
@@ -58,20 +50,20 @@ exports.set_temp_fail_intervals = function () {
     //      it with the equivalent times of maxTempFailures using the original 2^N formula
     //   3) the word "none" can be specified if you do not want to retry a temp failure,
     //      equivalent behavior of specifying maxTempFailures=1
-    const cfg = this.cfg;
+    const { cfg } = this;
 
     // Fallback function to create an array of the original retry times
     function set_old_defaults () {
         cfg.temp_fail_intervals = [];
         for (let i=1; i<cfg.maxTempFailures; i++) {
-            cfg.temp_fail_intervals.push(Math.pow(2, (i + 5)));
+            cfg.temp_fail_intervals.push(2 ** (i + 5));
         }
     }
 
     // Helpful error function in case of parsing failure
     function error (i, msg) {
-        logger.logerror(`outbound temp_fail_intervals syntax error parsing element ${i}: ${msg}`);
-        logger.logwarn('Setting outbound temp_fail_intervals to old defaults because of previous error');
+        logger.error(exports, `temp_fail_intervals syntax error parsing element ${i}: ${msg}`);
+        logger.warn(exports, 'Setting outbound temp_fail_intervals to old defaults');
         set_old_defaults();
     }
 
@@ -109,13 +101,13 @@ exports.set_temp_fail_intervals = function () {
                 // do nothing, this is the base unit
                 break;
             case 'm':
-                num = num * 60;
+                num *= 60;
                 break;
             case 'h':
-                num = num * 3600;
+                num *= 3600;
                 break;
             case 'd':
-                num = num * 86400;
+                num *= 86400;
                 break;
             default:
                 return error(i, 'invalid time span symbol');

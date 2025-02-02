@@ -3,7 +3,7 @@
 // in the mail_from.blocklist file. You need to be running the
 // mail_from.blocklist plugin for this to work fully.
 
-const fs    = require('fs');
+const fs    = require('node:fs');
 const utils = require('haraka-utils');
 
 exports.hook_data = (next, connection) => {
@@ -13,14 +13,10 @@ exports.hook_data = (next, connection) => {
 }
 
 exports.hook_data_post = function (next, connection) {
-    if (!connection.relaying) {
-        return next();
-    }
+    if (!connection?.relaying || !connection?.transaction) return next();
 
     const recip = (this.config.get('block_me.recipient') || '').toLowerCase();
     const senders = this.config.get('block_me.senders', 'list');
-
-    const self = this;
 
     // Make sure only 1 recipient
     if (connection.transaction.rcpt_to.length != 1) {
@@ -52,7 +48,7 @@ exports.hook_data_post = function (next, connection) {
     // add to mail_from.blocklist
     fs.open('./config/mail_from.blocklist', 'a', (err, fd) => {
         if (err) {
-            connection.logerror(self, `Unable to append to mail_from.blocklist: ${err}`);
+            connection.logerror(this, `Unable to append to mail_from.blocklist: ${err}`);
             return;
         }
         fs.write(fd, `${to_block}\n`, null, 'UTF-8', (err2, written) => {

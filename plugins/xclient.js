@@ -1,9 +1,10 @@
 // Implementation of XCLIENT protocol
 // See http://www.postfix.org/XCLIENT_README.html
 
+const net = require('node:net');
+
 const utils = require('haraka-utils');
 const DSN = require('haraka-dsn');
-const net = require('net');
 let allowed_hosts = {};
 
 exports.register = function () {
@@ -11,9 +12,8 @@ exports.register = function () {
 }
 
 exports.load_xclient_hosts = function () {
-    const self = this;
     const cfg = this.config.get('xclient.hosts', 'list', () => {
-        self.load_xclient_hosts();
+        this.load_xclient_hosts();
     });
     const ah = {};
     for (const i in cfg) {
@@ -23,10 +23,7 @@ exports.load_xclient_hosts = function () {
 }
 
 function xclient_allowed (ip) {
-    if (ip === '127.0.0.1' || ip === '::1' || allowed_hosts[ip]) {
-        return true;
-    }
-    return false;
+    return !!(ip === '127.0.0.1' || ip === '::1' || allowed_hosts[ip]);
 }
 
 exports.hook_capabilities = (next, connection) => {
@@ -37,17 +34,14 @@ exports.hook_capabilities = (next, connection) => {
 }
 
 exports.hook_unrecognized_command = function (next, connection, params) {
-    if (params[0] !== 'XCLIENT') {
-        return next();
-    }
+    if (params[0] !== 'XCLIENT') return next();
 
     // XCLIENT is not allowed after transaction start
-    if (connection.transaction) {
-        return next(DENY,
-            DSN.proto_unspecified('Mail transaction in progress', 503));
+    if (connection?.transaction) {
+        return next(DENY, DSN.proto_unspecified('Mail transaction in progress', 503));
     }
 
-    if (!(xclient_allowed(connection.remote.ip))) {
+    if (!(xclient_allowed(connection?.remote?.ip))) {
         return next(DENY, DSN.proto_unspecified('Not authorized', 550));
     }
 
@@ -55,8 +49,8 @@ exports.hook_unrecognized_command = function (next, connection, params) {
     // Process arguments
     const args = (new String(params[1])).toLowerCase().split(/ /);
     const xclient = {};
-    for (let a=0; a < args.length; a++) {
-        const match = /^([^=]+)=([^ ]+)/.exec(args[a]);
+    for (const arg of args) {
+        const match = /^([^=]+)=([^ ]+)/.exec(arg);
         if (match) {
             connection.logdebug(this, `found key=${match[1]} value=${match[2]}`);
             switch (match[1]) {
@@ -94,18 +88,17 @@ exports.hook_unrecognized_command = function (next, connection, params) {
                     }
                     break;
                 default:
-                    connection.logwarn(this, `unknown argument: ${args[a]}`);
+                    connection.logwarn(this, `unknown argument: ${arg}`);
             }
         }
         else {
-            connection.logwarn(this, `unknown argument: ${args[a]}`);
+            connection.logwarn(this, `unknown argument: ${arg}`);
         }
     }
 
     // Abort if we don't have a valid IP address
     if (!xclient.addr) {
-        return next(DENY,
-            DSN.proto_invalid_cmd_args('No valid IP address found', 501));
+        return next(DENY, DSN.proto_invalid_cmd_args('No valid IP address found', 501));
     }
 
     // Apply changes
@@ -125,10 +118,7 @@ exports.hook_unrecognized_command = function (next, connection, params) {
     }
     connection.esmtp = (xclient.proto === 'esmtp');
     connection.xclient = true;
-    if (!xclient.name) {
-        return next(NEXT_HOOK, 'lookup_rdns');
-    }
-    else {
-        return next(NEXT_HOOK, 'connect');
-    }
+    if (!xclient.name) return next(NEXT_HOOK, 'lookup_rdns');
+
+    next(NEXT_HOOK, 'connect');
 }

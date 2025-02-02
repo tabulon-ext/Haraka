@@ -7,21 +7,17 @@
 // than a bunch of connections to a single host from the configuration values
 // in "host" and "port" (see host_pool.js).
 
-// node.js builtins
-const events       = require('events');
+const events = require('node:events');
 
-// npm deps
-const generic_pool = require('generic-pool');
-const ipaddr       = require('ipaddr.js');
-const net_utils    = require('haraka-net-utils');
-const utils        = require('haraka-utils');
+const ipaddr    = require('ipaddr.js');
+const net_utils = require('haraka-net-utils');
+const utils     = require('haraka-utils');
 
-// haraka libs
-const line_socket = require('./line_socket');
-const logger      = require('./logger');
-const HostPool    = require('./host_pool');
+const tls_socket = require('./tls_socket')
+const logger     = require('./logger');
+const HostPool   = require('./host_pool');
 
-const smtp_regexp = /^([0-9]{3})([ -])(.*)/;
+const smtp_regexp = /^(\d{3})([ -])(.*)/;
 const STATE = {
     IDLE: 1,
     ACTIVE: 2,
@@ -30,11 +26,11 @@ const STATE = {
 }
 
 class SMTPClient extends events.EventEmitter {
-    constructor (port, host, connect_timeout, idle_timeout, socket) {
+    constructor (opts = {}) {
         super();
         this.uuid = utils.uuid();
-        this.connect_timeout = parseInt(connect_timeout) || 30;
-        this.socket = socket || line_socket.connect(port, host);
+        this.connect_timeout = parseInt(opts.connect_timeout) || 30;
+        this.socket = opts.socket || this.get_socket(opts)
         this.socket.setTimeout(this.connect_timeout * 1000);
         this.socket.setKeepAlive(true);
         this.state = STATE.IDLE;
@@ -44,8 +40,8 @@ class SMTPClient extends events.EventEmitter {
         this.authenticating= false;
         this.authenticated = false;
         this.auth_capabilities = [];
-        this.host = host;
-        this.port = port;
+        this.host = opts.host;
+        this.port = opts.port;
         this.smtputf8 = false;
 
         const client = this;
@@ -67,8 +63,11 @@ class SMTPClient extends events.EventEmitter {
             if (cont !== ' ') return;
 
             if (client.command === 'auth' || client.authenticating) {
-                logger.loginfo(`SERVER RESPONSE, CLIENT ${client.command}, authenticating=${client.authenticating},code=${code},cont=${cont},msg=${msg}`);
-                if (/^3/.test(code) && msg === 'VXNlcm5hbWU6') {
+                logger.info(`SERVER RESPONSE, CLIENT ${client.command}, authenticating=${client.authenticating},code=${code},cont=${cont},msg=${msg}`);
+                if (/^3/.test(code) && (
+                    msg === 'VXNlcm5hbWU6' ||
+                    msg === 'dXNlcm5hbWU6' // Workaround ill-mannered SMTP servers (namely smtp.163.com)
+                )) {
                     client.emit('auth_username');
                     return;
                 }
@@ -77,7 +76,7 @@ class SMTPClient extends events.EventEmitter {
                     return;
                 }
                 if (/^2/.test(code) && client.authenticating) {
-                    logger.loginfo('AUTHENTICATED');
+                    logger.info('AUTHENTICATED');
                     client.authenticating = false;
                     client.authenticated = true;
                     client.emit('auth');
@@ -150,10 +149,10 @@ class SMTPClient extends events.EventEmitter {
 
         client.socket.on('connect', () => {
             // Replace connection timeout with idle timeout
-            client.socket.setTimeout((idle_timeout || 300) * 1000);
+            client.socket.setTimeout((opts.idle_timeout || 300) * 1000);
             if (!client.socket.remoteAddress) {
                 // "Value may be undefined if the socket is destroyed"
-                logger.logdebug('socket.remoteAddress undefined');
+                logger.debug('socket.remoteAddress undefined');
                 return;
             }
             client.remote_ip = ipaddr.process(client.socket.remoteAddress).toString();
@@ -161,28 +160,28 @@ class SMTPClient extends events.EventEmitter {
 
         function closed (msg) {
             return error => {
-                if (!error) {
-                    error = '';
-                }
-                // msg is e.g. "errored" or "timed out"
+                if (!error) error = '';
+
                 // error is e.g. "Error: connect ECONNREFUSED"
                 const errMsg = `${client.uuid}: [${client.host}:${client.port}] SMTP connection ${msg} ${error}`;
-                if (client.state === STATE.ACTIVE) {
-                    client.emit('error', errMsg);
-                }
+
+                /* eslint-disable no-fallthrough */
                 switch (client.state) {
                     case STATE.ACTIVE:
+                        client.emit('error', errMsg);
                     case STATE.IDLE:
                     case STATE.RELEASED:
                         client.destroy();
                         break;
+                    case STATE.DESTROYED:
+                        if (msg === 'errored' || msg === 'timed out') {
+                            client.emit('connection-error', errMsg);
+                        }
+                        break
                     default:
                 }
-                if ((msg === 'errored' || msg === 'timed out') && client.state === STATE.DESTROYED) {
-                    client.emit('connection-error', errMsg);
-                } // don't return, continue (original behavior)
 
-                logger.logdebug(`[smtp_client_pool] ${errMsg} (state=${client.state})`);
+                logger.debug(`[smtp_client] ${errMsg} (state=${client.state})`);
             }
         }
 
@@ -217,17 +216,8 @@ class SMTPClient extends events.EventEmitter {
     }
 
     release () {
-        if (!this.connected || this.command === 'data' || this.command === 'mailbody') {
-            // Destroy here, we can't reuse a connection that was mid-data.
-            this.destroy();
-            return;
-        }
-
-        logger.logdebug(`[smtp_client_pool] ${this.uuid} resetting, state=${this.state}`);
-        if (this.state === STATE.DESTROYED) {
-            return;
-        }
-        this.state = STATE.RELEASED;
+        if (this.state === STATE.DESTROYED) return;
+        logger.debug(`[smtp_client] ${this.uuid} releasing, state=${this.state}`);
 
         [
             'auth',   'bad_code', 'capabilities', 'client_protocol', 'connection-error',
@@ -237,114 +227,60 @@ class SMTPClient extends events.EventEmitter {
             this.removeAllListeners(l);
         })
 
-        this.on('bad_code', (code, msg) => {
-            this.destroy();
-        });
-
-        this.on('rset', () => {
-            logger.logdebug(`[smtp_client_pool] ${this.uuid} releasing, state=${this.state}`);
-            if (this.state === STATE.DESTROYED) return;
-
-            this.state = STATE.IDLE;
-            this.removeAllListeners('rset');
-            this.removeAllListeners('bad_code');
-            this.pool.release(this);
-        });
-
-        this.send_command('RSET');
+        if (this.connected) this.send_command('QUIT');
+        this.destroy()
     }
 
     destroy () {
-        if (this.state !== STATE.DESTROYED) {
-            this.pool.destroy(this);
-        }
+        if (this.state === STATE.DESTROYED) return
+        this.state = STATE.DESTROYED;
+        this.socket.destroy();
     }
 
     upgrade (tls_options) {
-        const this_logger = logger;
 
         this.socket.upgrade(tls_options, (verified, verifyError, cert, cipher) => {
-            this_logger.loginfo(`secured:${
+            logger.info(`secured:${
+
                 (cipher) ? ` cipher=${cipher.name} version=${cipher.version}` : ''
             } verified=${verified}${
                 (verifyError) ? ` error="${verifyError}"` : ''
-            }${(cert && cert.subject) ? ` cn="${cert.subject.CN}" organization="${cert.subject.O}"` : ''
-            }${(cert && cert.issuer) ? ` issuer="${cert.issuer.O}"` : ''
-            }${(cert && cert.valid_to) ? ` expires="${cert.valid_to}"` : ''
-            }${(cert && cert.fingerprint) ? ` fingerprint=${cert.fingerprint}` : ''}`);
+            }${(cert?.subject) ? ` cn="${cert.subject.CN}" organization="${cert.subject.O}"` : ''
+            }${(cert?.issuer) ? ` issuer="${cert.issuer.O}"` : ''
+            }${(cert?.valid_to) ? ` expires="${cert.valid_to}"` : ''
+            }${(cert?.fingerprint) ? ` fingerprint=${cert.fingerprint}` : ''}`);
         });
     }
 
-
     is_dead_sender (plugin, connection) {
-        if (connection.transaction) return false;
+        if (connection?.transaction) return false;
 
         // This likely means the sender went away on us, cleanup.
         connection.logwarn(plugin, "transaction went away, releasing smtp_client");
         this.release();
         return true;
     }
+
+    get_socket(opts) {
+        const socket = tls_socket.connect({
+            host: opts.host,
+            port: opts.port,
+            timeout: this.connect_timeout,
+        })
+        net_utils.add_line_processor(socket)
+        return socket
+    }
 }
 
 exports.smtp_client = SMTPClient;
 
-// Separate pools are kept for each set of server attributes.
-exports.get_pool = (server, port, host, cfg) => {
-    port = port || 25;
-    host = host || 'localhost';
-    if (cfg === undefined) cfg = {};
-    const connect_timeout = cfg.connect_timeout || 30;
-    const pool_timeout = cfg.pool_timeout || cfg.timeout || 300;
-    const auth_user = cfg.auth_user || 'no_user';
-    const name = `${port}:${host}:${pool_timeout}:${auth_user}`;
-    if (!server.notes.pool) server.notes.pool = {};
-    if (server.notes.pool[name]) return server.notes.pool[name];
-
-    const pool = generic_pool.Pool({
-        name,
-        create: callback => {
-            const smtp_client = new SMTPClient(port, host, connect_timeout, pool_timeout);
-            logger.logdebug(`[smtp_client_pool] uuid=${smtp_client.uuid} host=${host}` +
-                ` port=${port} pool_timeout=${pool_timeout} created`);
-            callback(null, smtp_client);
-        },
-        destroy: smtp_client => {
-            logger.logdebug(`[smtp_client_pool] ${smtp_client.uuid} destroyed, state={smtp_client.state}`);
-            smtp_client.state = STATE.DESTROYED;
-            smtp_client.socket.destroy();
-            // Remove pool object from server notes once empty
-            const size = pool.getPoolSize();
-            if (size === 0) {
-                delete server.notes.pool[name];
-            }
-        },
-        max: cfg.max_connections || 1000,
-        idleTimeoutMillis: (pool_timeout - 1) * 1000,
-        log: (str, level) => {
-            level = (level === 'verbose') ? 'debug' : level;
-            logger[`log${level}`](`[smtp_client_pool] [${name}] ${str}`);
-        }
-    });
-
-    const acquire = pool.acquire;
-    pool.acquire = (callback, priority) => {
-        function callback_wrapper (err, smtp_client) {
-            smtp_client.pool = pool;
-            smtp_client.state = STATE.ACTIVE;
-            callback(err, smtp_client);
-        }
-        acquire.call(pool, callback_wrapper, priority);
-    };
-    server.notes.pool[name] = pool;
-    return pool;
-}
-
 // Get a smtp_client for the given attributes.
-exports.get_client = (server, callback, port, host, cfg) => {
-    const pool = exports.get_pool(server, port, host, cfg);
-    pool.acquire(callback);
+// used only in testing
+exports.get_client = (server, callback, opts = {}) => {
+    const smtp_client = new SMTPClient(opts)
+    logger.debug(`[smtp_client] uuid=${smtp_client.uuid} host=${opts.host} port=${opts.port} created`)
+    callback(smtp_client)
 }
-
 
 exports.onCapabilitiesOutbound = (smtp_client, secured, connection, config, on_secured) => {
     for (const line in smtp_client.response) {
@@ -383,8 +319,8 @@ exports.onCapabilitiesOutbound = (smtp_client, secured, connection, config, on_s
         if (auth_matches) {
             smtp_client.auth_capabilities = [];
             auth_matches = auth_matches[1].split(' ');
-            for (let i = 0; i < auth_matches.length; i++) {
-                smtp_client.auth_capabilities.push(auth_matches[i].toLowerCase());
+            for (const authMatch of auth_matches) {
+                smtp_client.auth_capabilities.push(authMatch.toLowerCase());
             }
         }
     }
@@ -406,122 +342,119 @@ exports.get_client_plugin = (plugin, connection, c, callback) => {
     }
 
     const hostport = get_hostport(connection, connection.server, c);
+    const smtp_client = new SMTPClient(hostport)
+    logger.info(`[smtp_client] uuid=${smtp_client.uuid} host=${hostport.host} port=${hostport.port} created`);
 
-    const pool = exports.get_pool(connection.server, hostport.port, hostport.host, c);
+    connection.logdebug(plugin, `Got smtp_client: ${smtp_client.uuid}`);
 
-    pool.acquire((err, smtp_client) => {
-        connection.logdebug(plugin, `Got smtp_client: ${smtp_client.uuid}`);
+    let secured = false;
 
-        let secured = false;
+    smtp_client.load_tls_config(plugin.tls_options);
 
-        smtp_client.load_tls_config(plugin.tls_options);
-
-        smtp_client.call_next = function (retval, msg) {
-            if (this.next) {
-                const next = this.next;
-                delete this.next;
-                next(retval, msg);
-            }
+    smtp_client.call_next = function (retval, msg) {
+        if (this.next) {
+            const { next } = this;
+            delete this.next;
+            next(retval, msg);
         }
+    }
 
-        smtp_client.on('client_protocol', (line) => {
-            connection.logprotocol(plugin, `C: ${line}`);
-        })
+    smtp_client.on('client_protocol', (line) => {
+        connection.logprotocol(plugin, `C: ${line}`);
+    })
 
-        smtp_client.on('server_protocol', (line) => {
-            connection.logprotocol(plugin, `S: ${line}`);
-        })
+    smtp_client.on('server_protocol', (line) => {
+        connection.logprotocol(plugin, `S: ${line}`);
+    })
 
-        function helo (command) {
-            if (smtp_client.xclient) {
-                smtp_client.send_command(command, connection.hello.host);
-            }
-            else {
-                smtp_client.send_command(command, connection.local.host);
-            }
+    function helo (command) {
+        if (smtp_client.xclient) {
+            smtp_client.send_command(command, connection.hello.host);
         }
-        smtp_client.on('greeting', helo);
-        smtp_client.on('xclient', helo);
-
-        function on_secured () {
-            secured = true;
-            smtp_client.secured = true;
-            smtp_client.emit('greeting', 'EHLO');
+        else {
+            smtp_client.send_command(command, connection.local.host);
         }
+    }
+    smtp_client.on('greeting', helo);
+    smtp_client.on('xclient', helo);
 
-        smtp_client.on('capabilities', () => {
-            exports.onCapabilitiesOutbound(smtp_client, secured, connection, c, on_secured);
-        });
+    function on_secured () {
+        if (secured) return;
+        secured = true;
+        smtp_client.secured = true;
+        smtp_client.emit('greeting', 'EHLO');
+    }
 
-        smtp_client.on('helo', () => {
-            if (!c.auth || smtp_client.authenticated) {
-                if (smtp_client.is_dead_sender(plugin, connection)) {
-                    return;
-                }
-                smtp_client.send_command('MAIL', `FROM:${connection.transaction.mail_from.format(!smtp_client.smtp_utf8)}`);
-                return;
-            }
+    smtp_client.on('capabilities', () => {
+        exports.onCapabilitiesOutbound(smtp_client, secured, connection, c, on_secured);
+    });
 
-            if (c.auth.type === null || typeof (c.auth.type) === 'undefined') return; // Ignore blank
-            const auth_type = c.auth.type.toLowerCase();
-            if (!smtp_client.auth_capabilities.includes(auth_type)) {
-                throw new Error(`Auth type "${auth_type}" not supported by server (supports: ${smtp_client.auth_capabilities.join(',')})`);
-            }
-            switch (auth_type) {
-                case 'plain':
-                    if (!c.auth.user || !c.auth.pass) {
-                        throw new Error("Must include auth.user and auth.pass for PLAIN auth.");
-                    }
-                    logger.logdebug(`[smtp_client_pool] uuid=${smtp_client.uuid} authenticating as "${c.auth.user}"`);
-                    smtp_client.send_command('AUTH',
-                        `PLAIN ${utils.base64(`${c.auth.user}\0${c.auth.user}\0${c.auth.pass}`)}`);
-                    break;
-                case 'cram-md5':
-                    throw new Error("Not implemented");
-                default:
-                    throw new Error(`Unknown AUTH type: ${auth_type}`);
-            }
-        });
-
-        smtp_client.on('auth', () => {
-            // if authentication has been handled by plugin(s)
-            if (smtp_client.authenticating) return;
-
+    smtp_client.on('helo', () => {
+        if (!c.auth || smtp_client.authenticated) {
             if (smtp_client.is_dead_sender(plugin, connection)) return;
 
-            smtp_client.authenticated = true;
             smtp_client.send_command('MAIL', `FROM:${connection.transaction.mail_from.format(!smtp_client.smtp_utf8)}`);
-        });
-
-        // these errors only get thrown when the connection is still active
-        smtp_client.on('error', (msg) => {
-            connection.logwarn(plugin, msg);
-            smtp_client.call_next();
-        });
-
-        // these are the errors thrown when the connection is dead
-        smtp_client.on('connection-error', (error) => {
-            // error contains e.g. "Error: connect ECONNREFUSE"
-            logger.logerror(`backend failure: ${smtp_client.host}:${smtp_client.port} - ${error}`);
-            const host_pool = connection.server.notes.host_pool;
-            // only exists for if forwarding_host_pool is set in the config
-            if (host_pool) {
-                host_pool.failed(smtp_client.host, smtp_client.port);
-            }
-            smtp_client.call_next();
-        });
-
-        if (smtp_client.connected) {
-            if (smtp_client.xclient) {
-                smtp_client.send_command('XCLIENT', `ADDR=${connection.remote.ip}`);
-            }
-            else {
-                smtp_client.emit('helo');
-            }
+            return;
         }
 
-        callback(err, smtp_client);
+        if (c.auth.type === null || typeof (c.auth.type) === 'undefined') return; // Ignore blank
+        const auth_type = c.auth.type.toLowerCase();
+        if (!smtp_client.auth_capabilities.includes(auth_type)) {
+            throw new Error(`Auth type "${auth_type}" not supported by server (supports: ${smtp_client.auth_capabilities.join(',')})`);
+        }
+        switch (auth_type) {
+            case 'plain':
+                if (!c.auth.user || !c.auth.pass) {
+                    throw new Error("Must include auth.user and auth.pass for PLAIN auth.");
+                }
+                logger.debug(`[smtp_client] uuid=${smtp_client.uuid} authenticating as "${c.auth.user}"`);
+                smtp_client.send_command('AUTH', `PLAIN ${utils.base64(`${c.auth.user}\0${c.auth.user}\0${c.auth.pass}`)}`);
+                break;
+            case 'cram-md5':
+                throw new Error("Not implemented");
+            default:
+                throw new Error(`Unknown AUTH type: ${auth_type}`);
+        }
     });
+
+    smtp_client.on('auth', () => {
+        // if authentication has been handled by plugin(s)
+        if (smtp_client.authenticating) return;
+
+        if (smtp_client.is_dead_sender(plugin, connection)) return;
+
+        smtp_client.authenticated = true;
+        smtp_client.send_command('MAIL', `FROM:${connection.transaction.mail_from.format(!smtp_client.smtp_utf8)}`);
+    });
+
+    // these errors only get thrown when the connection is still active
+    smtp_client.on('error', (msg) => {
+        connection.logwarn(plugin, msg);
+        smtp_client.call_next();
+    });
+
+    // these are the errors thrown when the connection is dead
+    smtp_client.on('connection-error', (error) => {
+        // error contains e.g. "Error: connect ECONNREFUSE"
+        logger.error(`backend failure: ${smtp_client.host}:${smtp_client.port} - ${error}`);
+        const { host_pool } = connection.server.notes;
+        // only exists for if forwarding_host_pool is set in the config
+        if (host_pool) {
+            host_pool.failed(smtp_client.host, smtp_client.port);
+        }
+        smtp_client.call_next();
+    });
+
+    if (smtp_client.connected) {
+        if (smtp_client.xclient) {
+            smtp_client.send_command('XCLIENT', `ADDR=${connection.remote.ip}`);
+        }
+        else {
+            smtp_client.emit('helo');
+        }
+    }
+
+    callback(null, smtp_client);
 }
 
 function get_hostport (connection, server, cfg) {
@@ -539,15 +472,12 @@ function get_hostport (connection, server, cfg) {
         const host = server.notes.host_pool.get_host();
         if (host) return host; // { host: 1.2.3.4, port: 567 }
 
-        logger.logerror('[smtp_client_pool] no backend hosts in pool!');
+        logger.error('[smtp_client] no backend hosts in pool!');
         throw new Error("no backend hosts found in pool!");
     }
 
-    if (cfg.host && cfg.port) {
-        return { host: cfg.host, port: cfg.port };
-    }
+    if (cfg.host && cfg.port) return { host: cfg.host, port: cfg.port };
 
-    logger.logwarn("[smtp_client_pool] forwarding_host_pool or host and port " +
-            "were not found in config file");
+    logger.warn("[smtp_client] forwarding_host_pool or host and port were not found in config file");
     throw new Error("You must specify either forwarding_host_pool or host and port");
 }

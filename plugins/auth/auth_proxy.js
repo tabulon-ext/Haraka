@@ -1,21 +1,22 @@
 // Proxy AUTH requests selectively by domain
-const sock  = require('./line_socket');
+
+const net = require('node:net')
+
 const utils = require('haraka-utils');
-const smtp_regexp = /^([0-9]{3})([ -])(.*)/;
+const net_utils = require('haraka-net-utils')
+
+const smtp_regexp = /^(\d{3})([ -])(.*)/;
 
 exports.register = function () {
-    const plugin = this;
-    plugin.inherits('auth/auth_base');
-    plugin.load_tls_ini();
+    this.inherits('auth/auth_base');
+    this.load_tls_ini();
 }
 
 exports.load_tls_ini = function () {
-    const plugin = this;
-    plugin.tls_cfg = plugin.config.get('tls.ini', () => {
-        plugin.load_tls_ini();
+    this.tls_cfg = this.config.get('tls.ini', () => {
+        this.load_tls_ini();
     });
 }
-
 
 exports.hook_capabilities = (next, connection) => {
     if (connection.tls.enabled) {
@@ -27,8 +28,8 @@ exports.hook_capabilities = (next, connection) => {
 }
 
 exports.check_plain_passwd = function (connection, user, passwd, cb) {
-    let domain;
-    if ((domain = /@([^@]+)$/.exec(user))) {
+    let domain = /@([^@]+)$/.exec(user);
+    if (domain) {
         domain = domain[1].toLowerCase();
     }
     else {
@@ -54,7 +55,8 @@ exports.try_auth_proxy = function (connection, hosts, user, passwd, cb) {
     }
 
     const self = this;
-    const host = hosts.shift();
+    let [ host, port ] = hosts.shift().split(':'); /* eslint prefer-const: 0 */
+    if (!port) port = 25
     let methods = [];
     let auth_complete = false;
     let auth_success = false;
@@ -62,29 +64,28 @@ exports.try_auth_proxy = function (connection, hosts, user, passwd, cb) {
     let response = [];
     let secure = false;
 
-    const hostport = host.split(/:/);
-    const socket = sock.connect(((hostport[1]) ? hostport[1] : 25), hostport[0]);
-    connection.logdebug(self, `attempting connection to host=${hostport[0]} port=${(hostport[1]) ? hostport[1] : 25}`);
+    const socket = net.connect({ host, port });
+    net_utils.add_line_processor(socket)
+    connection.logdebug(this, `attempting connection to host=${host} port=${port}`);
     socket.setTimeout(30 * 1000);
     socket.on('connect', () => { });
     socket.on('close', () => {
         if (!auth_complete) {
             // Try next host
-            return self.try_auth_proxy(connection, hosts, user, passwd, cb);
+            return this.try_auth_proxy(connection, hosts, user, passwd, cb);
         }
-        connection.loginfo(self, `AUTH user="${user}" host="${host}" success=${auth_success}`);
-        return cb(auth_success);
+        connection.loginfo(this, `AUTH user="${user}" host="${host}" success=${auth_success}`);
+        cb(auth_success);
     });
     socket.on('timeout', () => {
-        connection.logerror(self, "connection timed out");
+        connection.logerror(this, "connection timed out");
         socket.end();
         // Try next host
-        return self.try_auth_proxy(connection, hosts, user, passwd, cb);
+        this.try_auth_proxy(connection, hosts, user, passwd, cb);
     });
     socket.on('error', err => {
-        connection.logerror(self, `connection failed to host ${host}: ${err}`);
+        connection.logerror(this, `connection failed to host ${host}: ${err}`);
         socket.end();
-        return;
     });
     socket.send_command = function (cmd, data) {
         let line = cmd + (data ? (` ${data}`) : '');
@@ -117,7 +118,7 @@ exports.try_auth_proxy = function (connection, hosts, user, passwd, cb) {
 
         connection.logdebug(self, `command state: ${command}`);
         if (command === 'ehlo') {
-            if (code[0] === '5') {
+            if (code.startsWith('5')) {
                 // EHLO command rejected; abort
                 socket.send_command('QUIT');
                 return;
@@ -131,6 +132,7 @@ exports.try_auth_proxy = function (connection, hosts, user, passwd, cb) {
                     cert = self.config.get(self.tls_cfg.main.cert || 'tls_cert.pem', 'binary');
                     if (key && cert) {
                         this.on('secure', () => {
+                            if (secure) return;
                             secure = true;
                             socket.send_command('EHLO', connection.local.host);
                         });
@@ -163,21 +165,21 @@ exports.try_auth_proxy = function (connection, hosts, user, passwd, cb) {
         }
         if (command === 'auth') {
             // Handle LOGIN
-            if (code[0] === '3' && response[0] === 'VXNlcm5hbWU6') {
+            if (code.startsWith('3') && response[0] === 'VXNlcm5hbWU6') {
                 // Write to the socket directly to keep the state at 'auth'
                 this.write(`${utils.base64(user)}\r\n`);
                 response = [];
                 return;
             }
-            else if (code[0] === '3' && response[0] === 'UGFzc3dvcmQ6') {
+            else if (code.startsWith('3') && response[0] === 'UGFzc3dvcmQ6') {
                 this.write(`${utils.base64(passwd)}\r\n`);
                 response = [];
                 return;
             }
-            if (code[0] === '5') {
+            if (code.startsWith('5')) {
                 // Initial attempt failed; strip domain and retry.
-                let u;
-                if ((u = /^([^@]+)@.+$/.exec(user))) {
+                const u = /^([^@]+)@.+$/.exec(user)
+                if (u) {
                     user = u[1];
                     if (methods.includes('PLAIN')) {
                         socket.send_command('AUTH', `PLAIN ${utils.base64(`\0${user}\0${passwd}`)}`);

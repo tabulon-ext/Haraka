@@ -1,22 +1,16 @@
 'use strict';
 // An SMTP Transaction
 
-// node.js built-in modules
-const util   = require('util');
+const util   = require('node:util');
 
-// haraka npm modules
 const Notes  = require('haraka-notes');
 const utils  = require('haraka-utils');
-
-// Haraka modules
-const Header = require('./mailheader').Header;
-const body   = require('./mailbody');
-const MessageStream = require('./messagestream');
+const message = require('haraka-email-message')
 
 class Transaction {
-    constructor (uuid, cfg) {
+    constructor (uuid, cfg = {}) {
         this.uuid = uuid || utils.uuid();
-        this.cfg = cfg || load_smtp_ini();
+        this.cfg = cfg;
         this.mail_from = null;
         this.rcpt_to = [];
         this.header_lines = [];
@@ -31,8 +25,8 @@ class Transaction {
         this.parse_body = false;
         this.notes = new Notes();
         this.notes.skip_plugins = [];
-        this.header = new Header();
-        this.message_stream = new MessageStream(this.cfg, this.uuid, this.header.header_list);
+        this.header = new message.Header();
+        this.message_stream = new message.stream(this.cfg, this.uuid, this.header.header_list);
         this.discard_data = false;
         this.resetting = false;
         this.rcpt_count = {
@@ -50,19 +44,18 @@ class Transaction {
     ensure_body () {
         if (this.body) return;
 
-        this.body = new body.Body(this.header);
+        this.body = new message.Body(this.header);
         this.body.on('mime_boundary', m => this.incr_mime_count());
-        this.attachment_start_hooks.forEach(h => {
-            this.body.on('attachment_start', h);
-        });
 
-        if (this.banner) {
-            this.body.set_banner(this.banner);
+        for (const hook of this.attachment_start_hooks) {
+            this.body.on('attachment_start', hook);
         }
+
+        if (this.banner) this.body.set_banner(this.banner);
 
         for (const o of this.body_filters) {
             this.body.add_filter((ct, enc, buf) => {
-                const re_match = (util.isRegExp(o.ct_match) && o.ct_match.test(ct.toLowerCase()));
+                const re_match = (util.types.isRegExp(o.ct_match) && o.ct_match.test(ct.toLowerCase()));
                 const ct_begins = ct.toLowerCase().indexOf(String(o.ct_match).toLowerCase()) === 0;
                 if (re_match || ct_begins) return o.filter(ct, enc, buf);
             })
@@ -149,12 +142,12 @@ class Transaction {
         }
         else if (this.header_pos === 0) {
             // Build up headers
-            if (this.header_lines.length < this.cfg.headers.max_lines) {
+            if (this.header_lines.length < (this.cfg?.headers?.max_lines || 1000)) {
                 if (line[0] === 0x2E) line = line.slice(1); // Strip leading '.'
                 this.header_lines.push(line.toString(this.encoding).replace(/\r\n$/, '\n'));
             }
         }
-        else if (this.header_pos && this.parse_body) {
+        else if (this.parse_body) {
             let new_line = line;
             if (new_line[0] === 0x2E) new_line = new_line.slice(1); // Strip leading "."
 
@@ -186,8 +179,8 @@ class Transaction {
             this.header_pos = header_pos;
             if (this.parse_body) {
                 this.ensure_body();
-                for (let j = 0; j < body_lines.length; j++) {
-                    this.body.parse_more(body_lines[j]);
+                for (const bodyLine of body_lines) {
+                    this.body.parse_more(bodyLine);
                 }
             }
         }
@@ -256,14 +249,4 @@ exports.Transaction = Transaction;
 
 exports.createTransaction = (uuid, cfg) => {
     return new Transaction(uuid, cfg);
-}
-
-// sunset after test-fixtures createTransaction() is updated to pass in cfg
-function load_smtp_ini () {
-    const config = require('haraka-config');
-    const cfg = config.get('smtp.ini', { booleans: [ '+headers.add_received' ] });
-    if (!cfg.headers.max_lines) {
-        cfg.headers.max_lines = parseInt(config.get('max_header_lines')) || 1000;
-    }
-    return cfg;
 }

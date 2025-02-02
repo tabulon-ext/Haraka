@@ -21,18 +21,17 @@ exports.shutdown = () => {
 }
 
 exports.advertise_starttls = function (next, connection) {
-    const plugin = this;
 
     // if no TLS setup incomplete/invalid, don't advertise
     if (!tls_socket.tls_valid) {
-        plugin.logerror('no valid TLS config');
+        this.logerror('no valid TLS config');
         return next();
     }
 
     /* Caution: do not advertise STARTTLS if already TLS upgraded */
     if (connection.tls.enabled) return next();
 
-    if (plugin.net_utils.ip_in_list(tls_socket.cfg.no_tls_hosts, connection.remote.ip)) {
+    if (this.net_utils.ip_in_list(tls_socket.cfg.no_tls_hosts, connection.remote.ip)) {
         return next();
     }
 
@@ -52,20 +51,19 @@ exports.advertise_starttls = function (next, connection) {
         return enable_tls();
     }
 
-    const redis = server.notes.redis;
+    const { redis } = server.notes;
     const dbkey = `no_tls|${connection.remote.ip}`;
 
-    redis.get(dbkey, (err, dbr) => {
-        if (err) {
-            connection.results.add(plugin, {err});
-            return enable_tls();
-        }
-
-        if (!dbr) return enable_tls();
-
-        connection.results.add(plugin, { msg: 'no_tls'});
-        return next(CONT, 'STARTTLS disabled because previous attempt failed')
-    });
+    redis.get(dbkey)
+        .then(dbr => {
+            if (!dbr) return enable_tls();
+            connection.results.add(this, { msg: 'no_tls'});
+            next(CONT, 'STARTTLS disabled because previous attempt failed')
+        })
+        .catch(err => {
+            connection.results.add(this, {err});
+            enable_tls();
+        })
 }
 
 exports.set_notls = function (connection) {
@@ -77,7 +75,7 @@ exports.set_notls = function (connection) {
 
     this.lognotice(connection, `STARTTLS failed. Marking ${connection.remote.ip} as non-TLS host for ${expiry} seconds`);
 
-    server.notes.redis.setex(`no_tls|${connection.remote.ip}`, expiry, (new Date()).toISOString());
+    server.notes.redis.setEx(`no_tls|${connection.remote.ip}`, expiry, (new Date()).toISOString());
 }
 
 exports.upgrade_connection = function (next, connection, params) {
@@ -125,7 +123,7 @@ exports.upgrade_connection = function (next, connection, params) {
 
             connection.results.add(plugin, connection.tls);
             plugin.emit_upgrade_msg(connection, verified, verifyErr, cert, cipher);
-            return next(OK);  // Return OK as we responded to the client
+            next(OK);
         })
     })
 }
@@ -134,11 +132,10 @@ exports.hook_disconnect = (next, connection) => {
     if (connection.notes.cleanUpDisconnect) {
         connection.notes.cleanUpDisconnect(true);
     }
-    return next();
+    next();
 }
 
 exports.emit_upgrade_msg = function (conn, verified, verifyErr, cert, cipher) {
-    const plugin = this;
     let msg = 'secured:';
     if (cipher) {
         msg += ` cipher=${cipher.name} version=${cipher.version}`;
@@ -154,6 +151,6 @@ exports.emit_upgrade_msg = function (conn, verified, verifyErr, cert, cipher) {
         if (cert.fingerprint) msg += ` fingerprint=${cert.fingerprint}`;
     }
 
-    conn.loginfo(plugin,  msg);
+    conn.loginfo(this,  msg);
     return msg;
 }
