@@ -59,7 +59,7 @@ exports.hook_init_master = function (next, server) {
         process.title = title;
         server.notes.pt_concurrent_cluster = {};
         server.notes.pt_new_out_stats = [0,0,0,0];
-        const cluster = server.cluster;
+        const { cluster } = server;
         const recvMsg = msg => {
             let count;
             switch (msg.event) {
@@ -120,7 +120,7 @@ exports.hook_init_master = function (next, server) {
         });
     }
     this._interval = setupInterval(title, server);
-    return next();
+    next();
 }
 
 exports.hook_init_child = function (next, server) {
@@ -134,10 +134,9 @@ exports.hook_init_child = function (next, server) {
     server.notes.pt_messages = 0;
     server.notes.pt_mps_diff = 0;
     server.notes.pt_mps_max = 0;
-    const title = 'Haraka (worker)';
-    process.title = title;
-    this._interval = setupInterval(title, server);
-    return next();
+    process.title = 'Haraka (worker)';
+    this._interval = setupInterval(process.title, server);
+    next();
 }
 
 exports.shutdown = function () {
@@ -146,19 +145,19 @@ exports.shutdown = function () {
 }
 
 exports.hook_connect_init = (next, connection) => {
-    const server = connection.server;
+    const { server } = connection;
     connection.notes.pt_connect_run = true;
     if (server.cluster) {
-        const worker = server.cluster.worker;
+        const { worker } = server.cluster;
         worker.send({event: 'process_title.connect', wid: worker.id});
     }
     server.notes.pt_connections++;
     server.notes.pt_concurrent++;
-    return next();
+    next();
 }
 
 exports.hook_disconnect = (next, connection) => {
-    const server = connection.server;
+    const { server } = connection;
     // Check that the hook above ran
     // It might not if the disconnection is immediate
     // echo "QUIT" | nc localhost 25
@@ -177,25 +176,25 @@ exports.hook_disconnect = (next, connection) => {
         worker.send({event: 'process_title.disconnect', wid: worker.id});
     }
     server.notes.pt_concurrent--;
-    return next();
+    next();
 }
 
 exports.hook_rcpt = (next, connection) => {
-    const server = connection.server;
+    const { server } = connection;
     if (server.cluster) {
-        const worker = server.cluster.worker;
+        const { worker } = server.cluster;
         worker.send({event: 'process_title.recipient'});
     }
     server.notes.pt_recipients++;
-    return next();
+    next();
 }
 
 exports.hook_data = (next, connection) => {
-    const server = connection.server;
+    const { server } = connection;
     if (server.cluster) {
-        const worker = server.cluster.worker;
+        const { worker } = server.cluster;
         worker.send({event: 'process_title.message'});
     }
     server.notes.pt_messages++;
-    return next();
+    next();
 }

@@ -1,12 +1,7 @@
+## Haraka - a Node.js Mail Server
 
-Haraka - a Node.js Mail Server
-------------------------------
-
-![Tests](https://github.com/haraka/Haraka/workflows/Haraka%20Tests/badge.svg)
-![Tests - Windows](https://github.com/haraka/Haraka/workflows/Haraka%20Tests%20-%20Windows/badge.svg)
+![Tests](https://github.com/haraka/Haraka/actions/workflows/ci.yml/badge.svg)
 [![Coverage Status][cov-img]][cov-url]
-
-
 
 Haraka is a highly scalable [node.js][1] email server with a modular
 plugin architecture. Haraka can serve thousands of concurrent connections
@@ -27,10 +22,8 @@ queued for outbound delivery.
 
 ### Getting Help
 
-* [Join the mailing list][8] (implemented as a Haraka plugin)
-* [Join us on Slack][14]
-* [GitHub Issues][15]
-
+- [Join the mailing list][8] (implemented as a Haraka plugin)
+- [GitHub Issues][15]
 
 ### Screencast
 
@@ -50,7 +43,6 @@ code in Haraka.
 
 Plugins are provided for running mail through [SpamAssassin][9], validating
 [HELO][10] names, checking [DNS Blocklists][11], and [many others][12].
-
 
 ### Installing Haraka
 
@@ -95,7 +87,6 @@ overall behaviour of Haraka. By default, only messages to domains listed
 in `config/host_list` will be accepted and then delivered via the
 `smtp-forward` plugin. Configure the destination in `config/smtp_forward.ini`.
 
-
 ### Read the Fine Manual
 
 ```sh
@@ -104,7 +95,6 @@ haraka -h plugins/$name
 
 The docs detail how each plugin is configured. After editing
 `config/plugins`, restart Haraka and enjoy!
-
 
 ### Running from git
 
@@ -131,8 +121,7 @@ Finally run Haraka:
 
 Haraka is MIT licensed - see the [LICENSE][16] file for details.
 
-Haraka is a project started by [Matt Sergeant][17], a 10 year veteran of the email
-and anti-spam world. Previous projects have been the project leader for
+Haraka is a project started by [Matt Sergeant][17], a 10 year veteran of the email and anti-spam world. Previous projects have been the project leader for
 SpamAssassin and a hacker on [Qpsmtpd][13].
 
 [1]: http://nodejs.org/
@@ -143,15 +132,13 @@ SpamAssassin and a hacker on [Qpsmtpd][13].
 [6]: https://github.com/haraka/Haraka/blob/master/docs/plugins/dkim_sign.md
 [7]: https://en.wikipedia.org/wiki/Mail_delivery_agent
 [8]: mailto:haraka-sub@harakamail.com
-[9]: https://haraka.github.io/manual/plugins/spamassassin.html
-[10]: https://haraka.github.io/manual/plugins/helo.checks.html
-[11]: https://haraka.github.io/manual/plugins/dnsbl.html
-[12]: https://github.com/haraka/Haraka/tree/master/plugins
+[9]: https://haraka.github.io/plugins/spamassassin
+[10]: https://haraka.github.io/plugins/helo.checks
+[11]: https://haraka.github.io/plugins/dnsbl
+[12]: https://github.com/haraka/Haraka/blob/master/Plugins.md
 [13]: https://github.com/smtpd/qpsmtpd/
-[14]: https://communityinviter.com/apps/harakaserver/public-inviter
 [15]: https://github.com/haraka/Haraka/issues
 [16]: https://github.com/haraka/Haraka/blob/master/LICENSE
 [17]: https://github.com/baudehlo
-
 [cov-img]: https://codecov.io/github/haraka/Haraka/coverage.svg
 [cov-url]: https://codecov.io/github/haraka/Haraka?branch=master

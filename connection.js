@@ -1,12 +1,9 @@
 'use strict';
 // a single connection
 
-// node.js built-in libs
-const dns         = require('dns');
-const fs          = require('fs');
-const net         = require('net');
-const os          = require('os');
-const path        = require('path');
+const dns         = require('node:dns');
+const net         = require('node:net');
+const os          = require('node:os');
 
 // npm libs
 const ipaddr      = require('ipaddr.js');
@@ -15,7 +12,7 @@ const constants   = require('haraka-constants');
 const net_utils   = require('haraka-net-utils');
 const Notes       = require('haraka-notes');
 const utils       = require('haraka-utils');
-const Address     = require('address-rfc2821').Address;
+const { Address } = require('address-rfc2821');
 const ResultStore = require('haraka-results');
 
 // Haraka libs
@@ -27,64 +24,64 @@ const outbound    = require('./outbound');
 
 const states      = constants.connection.state;
 
-// Load HAProxy hosts into an object for fast lookups
-// as this list is checked on every new connection.
-let haproxy_hosts_ipv4 = [];
-let haproxy_hosts_ipv6 = [];
-function loadHAProxyHosts () {
-    const hosts = config.get('haproxy_hosts', 'list', loadHAProxyHosts);
-    const new_ipv4_hosts = [];
-    const new_ipv6_hosts = [];
-    for (let i=0; i<hosts.length; i++) {
-        const host = hosts[i].split(/\//);
-        if (net.isIPv6(host[0])) {
-            new_ipv6_hosts[i] = [ipaddr.IPv6.parse(host[0]), parseInt(host[1] || 64)];
-        }
-        else {
-            new_ipv4_hosts[i] = [ipaddr.IPv4.parse(host[0]), parseInt(host[1] || 32)];
-        }
+const cfg = config.get('connection.ini', {
+    booleans: [
+        '-main.strict_rfc1869',
+        '+main.smtputf8',
+        '+headers.add_received',
+        '+headers.show_version',
+        '+headers.clean_auth_results',
+    ]
+});
+
+const haproxy_hosts_ipv4 = [];
+const haproxy_hosts_ipv6 = [];
+
+for (const ip of cfg.haproxy.hosts) {
+    if (!ip) continue;
+    if (net.isIPv6(ip.split('/')[0])) {
+        haproxy_hosts_ipv6.push([ipaddr.IPv6.parse(ip.split('/')[0]), parseInt(ip.split('/')[1] || 64)]);
     }
-    haproxy_hosts_ipv4 = new_ipv4_hosts;
-    haproxy_hosts_ipv6 = new_ipv6_hosts;
+    else {
+        haproxy_hosts_ipv4.push([ipaddr.IPv4.parse(ip.split('/')[0]), parseInt(ip.split('/')[1] || 32)]);
+    }
 }
-loadHAProxyHosts();
 
 class Connection {
-    constructor (client, server, cfg) {
+    constructor (client, server, smtp_cfg) {
         this.client = client;
         this.server = server;
-        this.cfg = cfg;
 
-        this.local = {           // legacy property locations
-            ip: null,            // c.local_ip
-            port: null,          // c.local_port
+        this.local = {
+            ip: null,
+            port: null,
             host: net_utils.get_primary_host_name(),
             info: 'Haraka',
         };
         this.remote = {
-            ip:   null,          // c.remote_ip
-            port: null,          // c.remote_port
-            host: null,          // c.remote_host
-            info: null,          // c.remote_info
-            closed: false,       // c.remote_closed
+            ip:   null,
+            port: null,
+            host: null,
+            info: null,
+            closed: false,
             is_private: false,
             is_local: false,
         };
         this.hello = {
-            host: null,          // c.hello_host
-            verb: null,          // c.greeting
+            host: null,
+            verb: null,
         };
         this.tls = {
-            enabled: false,      // c.using_tls
-            advertised: false,   // c.notes.tls_enabled
+            enabled: false,
+            advertised: false,
             verified: false,
             cipher: {},
         };
         this.proxy = {
-            allowed: false,      // c.proxy
-            ip: null,            // c.haproxy_ip
+            allowed: false,
+            ip: null,
             type: null,
-            timer: null,         // c.proxy_timer
+            timer: null,
         };
         this.set('tls', 'enabled', (!!server.has_tls));
 
@@ -100,10 +97,6 @@ class Connection {
         this.transaction = null;
         this.tran_count = 0;
         this.capabilities = null;
-        this.ehlo_hello_message = config.get('ehlo_hello_message') || 'Haraka is at your service.';
-        this.connection_close_message = config.get('connection_close_message') || 'closing connection. Have a jolly good day.';
-        this.banner_includes_uuid = !!config.get('banner_includes_uuid');
-        this.deny_includes_uuid = config.get('deny_includes_uuid') || null;
         this.early_talker = false;
         this.pipelining = false;
         this._relaying = false;
@@ -112,8 +105,6 @@ class Connection {
         this.hooks_to_run = [];
         this.start_time = Date.now();
         this.last_reject = '';
-        this.max_bytes = parseInt(config.get('databytes')) || 0;
-        this.max_mime_parts = parseInt(config.get('max_mime_parts')) || 1000;
         this.totalbytes = 0;
         this.rcpt_count = {
             accept:   0,
@@ -125,15 +116,12 @@ class Connection {
             tempfail: 0,
             reject:   0,
         };
-        this.max_line_length = parseInt(config.get('max_line_length')) || 512;
-        this.max_data_line_length = parseInt(config.get('max_data_line_length')) || 992;
         this.results = new ResultStore(this);
         this.errors = 0;
         this.last_rcpt_msg = null;
         this.hook = null;
-        if (this.cfg.headers.show_version) {
-            const hpj = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json')));
-            this.local.info += `/${hpj.version}`;
+        if (cfg.headers.show_version) {
+            this.local.info += `/${utils.getVersion(__dirname)}`;
         }
         Connection.setupClient(this);
     }
@@ -204,7 +192,6 @@ class Connection {
         });
 
         const ha_list = net.isIPv6(self.remote.ip) ? haproxy_hosts_ipv6 : haproxy_hosts_ipv4;
-
         if (ha_list.some((element, index, array) => {
             return ipaddr.parse(self.remote.ip).match(element[0], element[1]);
         })) {
@@ -223,11 +210,10 @@ class Connection {
     setTLS (obj) {
         this.set('hello', 'host', undefined);
         this.set('tls',   'enabled', true);
-        const options = ['cipher','verified','verifyError','peerCertificate'];
-        options.forEach(t => {
+        for (const t of ['cipher','verified','verifyError','peerCertificate']) {
             if (obj[t] === undefined) return;
             this.set('tls', t, obj[t]);
-        })
+        }
         // prior to 2017-07, authorized and verified were both used. Verified
         // seems to be the more common and has the property updated in the
         // tls object. However, authorized has been up-to-date in the notes. Store
@@ -249,6 +235,7 @@ class Connection {
         let loc = this;
         for (let i=0; i < path_parts.length; i++) {
             const part = path_parts[i];
+            if (part === "__proto__" || part === "constructor") continue;
 
             // while another part remains
             if (i < (path_parts.length - 1)) {
@@ -268,25 +255,9 @@ class Connection {
                 this.set('remote.is_private', true);
             }
             else {
-                this.set('remote.is_private', net_utils.is_private_ipv4(this.remote.ip));
+                this.set('remote.is_private', net_utils.is_private_ip(this.remote.ip));
             }
         }
-
-        // sunset 3.0.0
-        if (prop_str === 'hello.verb') {
-            this.greeting = val;
-        }
-        else if (prop_str === 'tls.enabled') {
-            this.using_tls = val;
-        }
-        else if (prop_str === 'proxy.ip') {
-            this.haproxy_ip = val;
-        }
-        else {
-            const legacy_name = prop_str.split('.').join('_');
-            this[legacy_name] = val;
-        }
-        // /sunset
     }
     get (prop_str) {
         return prop_str.split('.').reduce((prev, curr) => {
@@ -306,7 +277,6 @@ class Connection {
         return this._relaying;
     }
     process_line (line) {
-        const self = this;
 
         if (this.state >= states.DISCONNECTING) {
             if (logger.would_log(logger.LOGPROTOCOL)) {
@@ -364,15 +334,14 @@ class Connection {
                 }
                 catch (err) {
                     if (err.stack) {
-                        const c = this;
-                        c.logerror(`${method} failed: ${err}`);
-                        err.stack.split("\n").forEach(c.logerror);
+                        this.logerror(`${method} failed: ${err}`);
+                        err.stack.split("\n").forEach(this.logerror);
                     }
                     else {
                         this.logerror(`${method} failed: ${err}`);
                     }
                     this.respond(421, "Internal Server Error", () => {
-                        self.disconnect();
+                        this.disconnect();
                     });
                 }
             }
@@ -396,7 +365,7 @@ class Connection {
     }
     process_data (data) {
         if (this.state >= states.DISCONNECTING) {
-            this.logwarn(`data after disconnect from ${this.remote.ip}`);
+            this.loginfo(`data after disconnect from ${this.remote.ip}`);
             return;
         }
 
@@ -415,7 +384,6 @@ class Connection {
         this._process_data();
     }
     _process_data () {
-        const self = this;
         // We *must* detect disconnected connections here as the state
         // only transitions to states.CMD in the respond function below.
         // Otherwise if multiple commands are pipelined and then the
@@ -424,10 +392,10 @@ class Connection {
 
         let maxlength;
         if (this.state === states.PAUSE_DATA || this.state === states.DATA) {
-            maxlength = this.max_data_line_length;
+            maxlength = cfg.max.data_line_length;
         }
         else {
-            maxlength = this.max_line_length;
+            maxlength = cfg.max.line_length;
         }
 
         let offset;
@@ -453,7 +421,7 @@ class Connection {
                     this.logdebug('[early_talker]', { state: this.state, esmtp: this.esmtp, line: this_line });
                 }
                 this.early_talker = true;
-                setImmediate(() => { self._process_data() });
+                setImmediate(() => { this._process_data() });
                 break;
             }
             else if ((this.state === states.PAUSE || this.state === states.PAUSE_SMTP) && this.esmtp) {
@@ -493,7 +461,7 @@ class Connection {
                         this.logdebug('[early_talker]', { state: this.state, esmtp: this.esmtp, line: this_line });
                     }
                     this.early_talker = true;
-                    setImmediate(() => { self._process_data() });
+                    setImmediate(() => { this._process_data() });
                 }
                 break;
             }
@@ -510,7 +478,7 @@ class Connection {
                 this.client.pause();
                 this.current_data = null;
                 return this.respond(521, "Command line too long", () => {
-                    self.disconnect();
+                    this.disconnect();
                 });
             }
             else {
@@ -540,6 +508,7 @@ class Connection {
             code = msg.code;
             msg = msg.reply;
         }
+
         if (!Array.isArray(msg)) {
             messages = msg.toString().split(/\n/);
         }
@@ -557,10 +526,10 @@ class Connection {
 
         if (code >= 400) {
             this.last_reject = `${code} ${messages.join(' ')}`;
-            if (this.deny_includes_uuid) {
+            if (cfg.uuid.deny_chars) {
                 uuid = (this.transaction || this).uuid;
-                if (this.deny_includes_uuid > 1) {
-                    uuid = uuid.substr(0, this.deny_includes_uuid);
+                if (cfg.uuid.deny_chars > 1) {
+                    uuid = uuid.substr(0, cfg.uuid.deny_chars);
                 }
             }
         }
@@ -575,6 +544,8 @@ class Connection {
             this.logprotocol(`S: ${line}`);
             buf = `${buf}${line}\r\n`;
         }
+
+        if (this.client.write === undefined) return buf;  // testing
 
         try {
             this.client.write(buf);
@@ -604,11 +575,10 @@ class Connection {
     }
     disconnect () {
         if (this.state >= states.DISCONNECTING) return;
-        const self = this;
-        self.state = states.DISCONNECTING;
-        self.current_data = null; // don't process any more data we have already received
+        this.state = states.DISCONNECTING;
+        this.current_data = null; // don't process any more data we have already received
         this.reset_transaction(() => {
-            plugins.run_hooks('disconnect', self);
+            plugins.run_hooks('disconnect', this);
         });
     }
     disconnect_respond () {
@@ -638,9 +608,7 @@ class Connection {
         this.client.end();
     }
     get_capabilities () {
-        const capabilities = [];
-
-        return capabilities;
+        return [];
     }
     tran_uuid () {
         this.tran_count++;
@@ -671,17 +639,16 @@ class Connection {
         this.resume();
     }
     init_transaction (cb) {
-        const self = this;
         this.reset_transaction(() => {
-            self.transaction = trans.createTransaction(self.tran_uuid(), self.cfg);
+            this.transaction = trans.createTransaction(this.tran_uuid(), cfg);
             // Catch any errors from the message_stream
-            self.transaction.message_stream.on('error', (err) => {
-                self.logcrit(`message_stream error: ${err.message}`);
-                self.respond('421', 'Internal Server Error', () => {
-                    self.disconnect();
+            this.transaction.message_stream.on('error', (err) => {
+                this.logcrit(`message_stream error: ${err.message}`);
+                this.respond('421', 'Internal Server Error', () => {
+                    this.disconnect();
                 });
             });
-            self.transaction.results = new ResultStore(self);
+            this.transaction.results = new ResultStore(this);
             if (cb) cb();
         });
     }
@@ -693,21 +660,19 @@ class Connection {
         this.respond(code, msg);
     }
     pause () {
-        const self = this;
-        if (self.state >= states.DISCONNECTING) return;
-        self.client.pause();
-        if (self.state !== states.PAUSE_DATA) self.prev_state = self.state;
-        self.state = states.PAUSE_DATA;
+        if (this.state >= states.DISCONNECTING) return;
+        this.client.pause();
+        if (this.state !== states.PAUSE_DATA) this.prev_state = this.state;
+        this.state = states.PAUSE_DATA;
     }
     resume () {
-        const self = this;
-        if (self.state >= states.DISCONNECTING) return;
-        self.client.resume();
-        if (self.prev_state) {
-            self.state = self.prev_state;
-            self.prev_state = null;
+        if (this.state >= states.DISCONNECTING) return;
+        this.client.resume();
+        if (this.prev_state) {
+            this.state = this.prev_state;
+            this.prev_state = null;
         }
-        setImmediate(() => self._process_data());
+        setImmediate(() => this._process_data());
     }
     /////////////////////////////////////////////////////////////////////////////
     // SMTP Responses
@@ -717,7 +682,6 @@ class Connection {
         plugins.run_hooks('lookup_rdns', this);
     }
     lookup_rdns_respond (retval, msg) {
-        const self = this;
         switch (retval) {
             case constants.ok:
                 this.set('remote', 'host', (msg || 'Unknown'));
@@ -730,7 +694,7 @@ class Connection {
             case constants.denydisconnect:
             case constants.disconnect:
                 this.respond(554, msg || "rDNS Lookup Failed", () => {
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             case constants.denysoft:
@@ -738,13 +702,20 @@ class Connection {
                 break;
             case constants.denysoftdisconnect:
                 this.respond(421, msg || "rDNS Temporary Failure", () => {
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             default:
-                dns.reverse(this.remote.ip, (err, domains) => {
-                    self.rdns_response(err, domains);
-                });
+                // BUG: dns.reverse throws on invalid input (and sometimes valid
+                // input nodejs/node#47847). Also throws when empty results
+                try {
+                    dns.reverse(this.remote.ip, (err, domains) => {
+                        this.rdns_response(err, domains);
+                    })
+                }
+                catch (err) {
+                    this.rdns_response(err, []);
+                }
         }
     }
     rdns_response (err, domains) {
@@ -767,7 +738,6 @@ class Connection {
         plugins.run_hooks('connect', this);
     }
     unrecognized_command_respond (retval, msg) {
-        const self = this;
         switch (retval) {
             case constants.ok:
                 // response already sent, cool...
@@ -781,7 +751,7 @@ class Connection {
             case constants.denydisconnect:
             case constants.denysoftdisconnect:
                 this.respond(retval === constants.denydisconnect ? 521 : 421, msg || "Unrecognized command", () => {
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             default:
@@ -790,7 +760,6 @@ class Connection {
         }
     }
     connect_respond (retval, msg) {
-        const self = this;
         // RFC 5321 Section 4.3.2 states that the only valid SMTP codes here are:
         // 220 = Service ready
         // 554 = Transaction failed (no SMTP service here)
@@ -802,7 +771,7 @@ class Connection {
             case constants.denydisconnect:
             case constants.disconnect:
                 this.respond(554, msg || "Your mail is not welcome here", () => {
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             case constants.denysoft:
@@ -810,23 +779,24 @@ class Connection {
                 break;
             case constants.denysoftdisconnect:
                 this.respond(421, msg || "Come back later", () => {
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             default: {
-                let greeting = config.get('smtpgreeting', 'list');
-                if (greeting.length) {
+                let greeting;
+                if (cfg.message.greeting?.length) {
                     // RFC5321 section 4.2
                     // Hostname/domain should appear after the 220
+                    greeting = [...cfg.message.greeting];
                     greeting[0] = `${this.local.host} ESMTP ${greeting[0]}`;
-                    if (this.banner_includes_uuid) {
-                        greeting[0] += ` (${this.uuid})`;
+                    if (cfg.uuid.banner_chars) {
+                        greeting[0] += ` (${this.uuid.substr(0, cfg.uuid.banner_chars)})`;
                     }
                 }
                 else {
                     greeting = `${this.local.host} ESMTP ${this.local.info} ready`;
-                    if (this.banner_includes_uuid) {
-                        greeting += ` (${this.uuid})`;
+                    if (cfg.uuid.banner_chars) {
+                        greeting += ` (${this.uuid.substr(0, cfg.uuid.banner_chars)})`;
                     }
                 }
                 this.respond(220, msg || greeting);
@@ -846,60 +816,58 @@ class Connection {
         }
     }
     helo_respond (retval, msg) {
-        const self = this;
         switch (retval) {
             case constants.deny:
                 this.respond(550, msg || "HELO denied", () => {
-                    self.set('hello', 'verb', null);
-                    self.set('hello', 'host', null);
+                    this.set('hello', 'verb', null);
+                    this.set('hello', 'host', null);
                 });
                 break;
             case constants.denydisconnect:
                 this.respond(550, msg || "HELO denied", () => {
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             case constants.denysoft:
                 this.respond(450, msg || "HELO denied", () => {
-                    self.set('hello', 'verb', null);
-                    self.set('hello', 'host', null);
+                    this.set('hello', 'verb', null);
+                    this.set('hello', 'host', null);
                 });
                 break;
             case constants.denysoftdisconnect:
                 this.respond(450, msg || "HELO denied", () => {
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             default:
                 // RFC5321 section 4.1.1.1
                 // Hostname/domain should appear after 250
-                this.respond(250, `${this.local.host} Hello ${this.get_remote('host')}${this.ehlo_hello_message}`);
+                this.respond(250, `${this.local.host} Hello ${this.get_remote('host')}, ${cfg.message.helo}`);
         }
     }
     ehlo_respond (retval, msg) {
-        const self = this;
 
         switch (retval) {
             case constants.deny:
                 this.respond(550, msg || "EHLO denied", () => {
-                    self.set('hello', 'verb', null);
-                    self.set('hello', 'host', null);
+                    this.set('hello', 'verb', null);
+                    this.set('hello', 'host', null);
                 });
                 break;
             case constants.denydisconnect:
                 this.respond(550, msg || "EHLO denied", () => {
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             case constants.denysoft:
                 this.respond(450, msg || "EHLO denied", () => {
-                    self.set('hello', 'verb', null);
-                    self.set('hello', 'host', null);
+                    this.set('hello', 'verb', null);
+                    this.set('hello', 'host', null);
                 });
                 break;
             case constants.denysoftdisconnect:
                 this.respond(450, msg || "EHLO denied", () => {
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             default: {
@@ -907,16 +875,14 @@ class Connection {
                 // Hostname/domain should appear after 250
 
                 const response = [
-                    `${this.local.host} Hello ${this.get_remote('host')}${this.ehlo_hello_message}`,
+                    `${this.local.host} Hello ${this.get_remote('host')}, ${cfg.message.helo}`,
                     "PIPELINING",
                     "8BITMIME",
                 ];
 
-                if (this.cfg.main.smtputf8) {
-                    response.push("SMTPUTF8");
-                }
+                if (cfg.main.smtputf8) response.push("SMTPUTF8");
 
-                response.push(`SIZE ${this.max_bytes}`);
+                response.push(`SIZE ${cfg.max.bytes}`);
 
                 this.capabilities = response;
 
@@ -929,32 +895,30 @@ class Connection {
         this.respond(250, this.capabilities);
     }
     quit_respond (retval, msg) {
-        const self = this;
-        this.respond(221, msg || `${this.local.host} ${this.connection_close_message}`, () => {
-            self.disconnect();
+        this.respond(221, msg || `${this.local.host} ${cfg.message.close}`, () => {
+            this.disconnect();
         });
     }
     vrfy_respond (retval, msg) {
-        const self = this;
         switch (retval) {
             case constants.deny:
                 this.respond(550, msg || "Access Denied", () => {
-                    self.reset_transaction();
+                    this.reset_transaction();
                 });
                 break;
             case constants.denydisconnect:
                 this.respond(550, msg || "Access Denied", () => {
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             case constants.denysoft:
                 this.respond(450, msg || "Lookup Failed", () => {
-                    self.reset_transaction();
+                    this.reset_transaction();
                 });
                 break;
             case constants.denysoftdisconnect:
                 this.respond(450, msg || "Lookup Failed", () => {
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             case constants.ok:
@@ -965,14 +929,13 @@ class Connection {
         }
     }
     noop_respond (retval, msg) {
-        const self = this;
         switch (retval) {
             case constants.deny:
                 this.respond(500, msg || "Stop wasting my time");
                 break;
             case constants.denydisconnect:
                 this.respond(500, msg || "Stop wasting my time", () => {
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             default:
@@ -980,14 +943,11 @@ class Connection {
         }
     }
     rset_respond (retval, msg) {
-        // We ignore any plugin responses
-        const self = this;
         this.respond(250, "OK", () => {
-            self.reset_transaction();
+            this.reset_transaction();
         })
     }
     mail_respond (retval, msg) {
-        const self = this;
         if (!this.transaction) {
             this.logerror("mail_respond found no transaction!");
             return;
@@ -1002,12 +962,12 @@ class Connection {
             }
         );
 
-        function store_results (action) {
+        const store_results = (action) => {
             let addr = sender.format();
             if (addr.length > 2) {  // all but null sender
                 addr = addr.substr(1, addr.length -2); // trim off < >
             }
-            self.transaction.results.add({name: 'mail_from'}, {
+            this.transaction.results.add({name: 'mail_from'}, {
                 action,
                 code: constants.translate(retval),
                 address: addr,
@@ -1018,25 +978,25 @@ class Connection {
             case constants.deny:
                 this.respond(550, msg || `${dmsg} denied`, () => {
                     store_results('reject');
-                    self.reset_transaction();
+                    this.reset_transaction();
                 });
                 break;
             case constants.denydisconnect:
                 this.respond(550, msg ||  `${dmsg} denied`, () => {
                     store_results('reject');
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             case constants.denysoft:
                 this.respond(450, msg || `${dmsg} denied`, () => {
                     store_results('tempfail');
-                    self.reset_transaction();
+                    this.reset_transaction();
                 });
                 break;
             case constants.denysoftdisconnect:
                 this.respond(450, msg || `${dmsg} denied`, () => {
                     store_results('tempfail');
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             default:
@@ -1068,9 +1028,8 @@ class Connection {
         this.transaction.results.push({name: 'rcpt_to'}, { recipient });
     }
     rcpt_ok_respond (retval, msg) {
-        const self = this;
         if (!this.transaction) {
-            self.results.add(this, {err: 'rcpt_ok_respond found no transaction'});
+            this.results.add(this, {err: 'rcpt_ok_respond found no transaction'});
             return;
         }
         if (!msg) msg = this.last_rcpt_msg;
@@ -1088,31 +1047,31 @@ class Connection {
         switch (retval) {
             case constants.deny:
                 this.respond(550, msg || `${dmsg} denied`, () => {
-                    self.rcpt_incr(rcpt, 'reject', msg, retval);
-                    self.transaction.rcpt_to.pop();
+                    this.rcpt_incr(rcpt, 'reject', msg, retval);
+                    this.transaction.rcpt_to.pop();
                 });
                 break;
             case constants.denydisconnect:
                 this.respond(550, msg || `${dmsg} denied`, () => {
-                    self.rcpt_incr(rcpt, 'reject', msg, retval);
-                    self.disconnect();
+                    this.rcpt_incr(rcpt, 'reject', msg, retval);
+                    this.disconnect();
                 });
                 break;
             case constants.denysoft:
                 this.respond(450, msg || `${dmsg} denied`, () => {
-                    self.rcpt_incr(rcpt, 'tempfail', msg, retval);
-                    self.transaction.rcpt_to.pop();
+                    this.rcpt_incr(rcpt, 'tempfail', msg, retval);
+                    this.transaction.rcpt_to.pop();
                 });
                 break;
             case constants.denysoftdisconnect:
                 this.respond(450, msg || `${dmsg} denied`, () => {
-                    self.rcpt_incr(rcpt, 'tempfail', msg, retval);
-                    self.disconnect();
+                    this.rcpt_incr(rcpt, 'tempfail', msg, retval);
+                    this.disconnect();
                 });
                 break;
             default:
                 this.respond(250, msg || `${dmsg} OK`, () => {
-                    self.rcpt_incr(rcpt, 'accept', msg, retval);
+                    this.rcpt_incr(rcpt, 'accept', msg, retval);
                 });
         }
     }
@@ -1121,7 +1080,6 @@ class Connection {
             retval = constants.ok;
         }
 
-        const self = this;
         if (!this.transaction) {
             this.results.add(this, {err: 'rcpt_respond found no transaction'});
             return;
@@ -1141,26 +1099,26 @@ class Connection {
         switch (retval) {
             case constants.deny:
                 this.respond(550, msg || `${dmsg} denied`, () => {
-                    self.rcpt_incr(rcpt, 'reject', msg, retval);
-                    self.transaction.rcpt_to.pop();
+                    this.rcpt_incr(rcpt, 'reject', msg, retval);
+                    this.transaction.rcpt_to.pop();
                 });
                 break;
             case constants.denydisconnect:
                 this.respond(550, msg || `${dmsg} denied`, () => {
-                    self.rcpt_incr(rcpt, 'reject', msg, retval);
-                    self.disconnect();
+                    this.rcpt_incr(rcpt, 'reject', msg, retval);
+                    this.disconnect();
                 });
                 break;
             case constants.denysoft:
                 this.respond(450, msg || `${dmsg} denied`, () => {
-                    self.rcpt_incr(rcpt, 'tempfail', msg, retval);
-                    self.transaction.rcpt_to.pop();
+                    this.rcpt_incr(rcpt, 'tempfail', msg, retval);
+                    this.transaction.rcpt_to.pop();
                 });
                 break;
             case constants.denysoftdisconnect:
                 this.respond(450, msg || `${dmsg} denied`, () => {
-                    self.rcpt_incr(rcpt, 'tempfail', msg, retval);
-                    self.disconnect();
+                    this.rcpt_incr(rcpt, 'tempfail', msg, retval);
+                    this.disconnect();
                 });
                 break;
             case constants.ok:
@@ -1174,8 +1132,8 @@ class Connection {
                 }
                 const rej_msg = `I cannot deliver mail for ${rcpt.format()}`;
                 this.respond(550, rej_msg, () => {
-                    self.rcpt_incr(rcpt, 'reject', rej_msg, retval);
-                    self.transaction.rcpt_to.pop();
+                    this.rcpt_incr(rcpt, 'reject', rej_msg, retval);
+                    this.transaction.rcpt_to.pop();
                 });
             }
         }
@@ -1184,7 +1142,6 @@ class Connection {
     // HAProxy support
 
     cmd_proxy (line) {
-        const self = this;
 
         if (!this.proxy.allowed) {
             this.respond(421, `PROXY not allowed from ${this.remote.ip}`);
@@ -1240,24 +1197,23 @@ class Connection {
         };
 
         this.reset_transaction(() => {
-            self.set('proxy.ip', self.remote.ip);
-            self.set('proxy.type', 'haproxy');
-            self.relaying = false;
-            self.set('local.ip', dst_ip);
-            self.set('local.port', parseInt(dst_port, 10));
-            self.set('remote.ip', src_ip);
-            self.set('remote.port', parseInt(src_port, 10));
-            self.set('remote.host', null);
-            self.set('hello.host', null);
-            plugins.run_hooks('connect_init', self);
+            this.set('proxy.ip', this.remote.ip);
+            this.set('proxy.type', 'haproxy');
+            this.relaying = false;
+            this.set('local.ip', dst_ip);
+            this.set('local.port', parseInt(dst_port, 10));
+            this.set('remote.ip', src_ip);
+            this.set('remote.port', parseInt(src_port, 10));
+            this.set('remote.host', null);
+            this.set('hello.host', null);
+            plugins.run_hooks('connect_init', this);
         });
     }
     /////////////////////////////////////////////////////////////////////////////
     // SMTP Commands
 
     cmd_internalcmd (line) {
-        const self = this;
-        if (!self.remote.is_local) {
+        if (!this.remote.is_local) {
             return this.respond(501, "INTERNALCMD not allowed remotely");
         }
         const results = (String(line)).split(/ +/);
@@ -1282,7 +1238,6 @@ class Connection {
         return this.respond(250, "Command sent for execution. Check Haraka logs for results.");
     }
     cmd_helo (line) {
-        const self = this;
         const results = (String(line)).split(/ +/);
         const host = results[0];
         if (!host) {
@@ -1290,14 +1245,13 @@ class Connection {
         }
 
         this.reset_transaction(() => {
-            self.set('hello', 'verb', 'HELO');
-            self.set('hello', 'host', host);
-            self.results.add({ name: 'helo' }, self.hello);
-            plugins.run_hooks('helo', self, host);
+            this.set('hello', 'verb', 'HELO');
+            this.set('hello', 'host', host);
+            this.results.add({ name: 'helo' }, this.hello);
+            plugins.run_hooks('helo', this, host);
         });
     }
     cmd_ehlo (line) {
-        const self = this;
         const results = (String(line)).split(/ +/);
         const host = results[0];
         if (!host) {
@@ -1305,10 +1259,10 @@ class Connection {
         }
 
         this.reset_transaction(() => {
-            self.set('hello', 'verb', 'EHLO');
-            self.set('hello', 'host', host);
-            self.results.add({ name: 'helo' }, self.hello);
-            plugins.run_hooks('ehlo', self, host);
+            this.set('hello', 'verb', 'EHLO');
+            this.set('hello', 'host', host);
+            this.results.add({ name: 'helo' }, this.hello);
+            plugins.run_hooks('ehlo', this, host);
         });
     }
     cmd_quit (args) {
@@ -1342,16 +1296,15 @@ class Connection {
             this.errors++;
             return this.respond(503, 'Use EHLO/HELO before MAIL');
         }
-        // Require authentication on connections to port 587 & 465
+        // Require authentication on ports 587 & 465
         if (!this.relaying && [587,465].includes(this.local.port)) {
             this.errors++;
             return this.respond(550, 'Authentication required');
         }
+
         let results;
-        let from;
         try {
-            results = rfc1869.parse('mail', line, this.cfg.main.strict_rfc1869 && !this.relaying);
-            from    = new Address (results.shift());
+            results = rfc1869.parse('mail', line, (!this.relaying && cfg.main.strict_rfc1869));
         }
         catch (err) {
             this.errors++;
@@ -1366,9 +1319,18 @@ class Connection {
                 return this.respond(452, 'Internal Server Error');
             }
             else {
-                return this.respond(501, ["Command parsing failed", err]);
+                return this.respond(501, ['Command parsing failed', err]);
             }
         }
+
+        let from;
+        try {
+            from = new Address(results.shift());
+        }
+        catch (err) {
+            return this.respond(501, `Invalid MAIL FROM address`);
+        }
+
         // Get rest of key=value pairs
         const params = {};
         results.forEach(param => {
@@ -1383,20 +1345,19 @@ class Connection {
         }
 
         // Handle SIZE extension
-        if (params && params.SIZE && params.SIZE > 0) {
-            if (this.max_bytes > 0 && params.SIZE > this.max_bytes) {
+        if (params?.SIZE && params.SIZE > 0) {
+            if (cfg.max.bytes > 0 && params.SIZE > cfg.max.bytes) {
                 return this.respond(550, 'Message too big!');
             }
         }
 
-        const self = this;
         this.init_transaction(() => {
-            self.transaction.mail_from = from;
-            if (self.hello.verb == 'HELO') {
-                self.transaction.encoding = 'binary';
-                self.encoding = 'binary';
+            this.transaction.mail_from = from;
+            if (this.hello.verb == 'HELO') {
+                this.transaction.encoding = 'binary';
+                this.encoding = 'binary';
             }
-            plugins.run_hooks('mail', self, [from, params]);
+            plugins.run_hooks('mail', this, [from, params]);
         });
     }
     cmd_rcpt (line) {
@@ -1406,10 +1367,8 @@ class Connection {
         }
 
         let results;
-        let recip;
         try {
-            results = rfc1869.parse('rcpt', line, this.cfg.main.strict_rfc1869 && !this.relaying);
-            recip   = new Address(results.shift());
+            results = rfc1869.parse('rcpt', line, cfg.main.strict_rfc1869 && !this.relaying);
         }
         catch (err) {
             this.errors++;
@@ -1427,6 +1386,15 @@ class Connection {
                 return this.respond(501, ["Command parsing failed", err]);
             }
         }
+
+        let recip;
+        try {
+            recip = new Address(results.shift());
+        }
+        catch (err) {
+            return this.respond(501, `Invalid RCPT TO address`);
+        }
+
         // Get rest of key=value pairs
         const params = {};
         results.forEach((param) => {
@@ -1471,8 +1439,8 @@ class Connection {
         return received_header;
     }
     auth_results (message) {
-        // http://tools.ietf.org/search/rfc7001
-        const has_tran = !!((this.transaction && this.transaction.notes));
+        // https://datatracker.ietf.org/doc/rfc7001/
+        const has_tran = !!((this.transaction?.notes));
 
         // initialize connection note
         if (!this.notes.authentication_results) {
@@ -1509,8 +1477,8 @@ class Connection {
         const ars = this.transaction.header.get_all('Authentication-Results');
         if (ars.length === 0) return;
 
-        for (let i=0; i < ars.length; i++) {
-            this.transaction.add_header('Original-Authentication-Results', ars[i]);
+        for (const element of ars) {
+            this.transaction.add_header('Original-Authentication-Results', element);
         }
         this.transaction.remove_header('Authentication-Results');
         this.logdebug("Authentication-Results moved to Original-Authentication-Results");
@@ -1534,33 +1502,32 @@ class Connection {
             return this.respond(503, "RCPT required first");
         }
 
-        if (this.cfg.headers.add_received) {
+        if (cfg.headers.add_received) {
             this.accumulate_data(`Received: ${this.received_line()}\r\n`);
         }
         plugins.run_hooks('data', this);
     }
     data_respond (retval, msg) {
-        const self = this;
         let cont = 0;
         switch (retval) {
             case constants.deny:
                 this.respond(554, msg || "Message denied", () => {
-                    self.reset_transaction();
+                    this.reset_transaction();
                 });
                 break;
             case constants.denydisconnect:
                 this.respond(554, msg || "Message denied", () => {
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             case constants.denysoft:
                 this.respond(451, msg || "Message denied", () => {
-                    self.reset_transaction();
+                    this.reset_transaction();
                 });
                 break;
             case constants.denysoftdisconnect:
                 this.respond(451, msg || "Message denied", () => {
-                    self.disconnect();
+                    this.disconnect();
                 });
                 break;
             default:
@@ -1571,12 +1538,11 @@ class Connection {
         // We already checked for MAIL/RCPT in cmd_data
         this.respond(354, "go ahead, make my day", () => {
             // OK... now we get the data
-            self.state = states.DATA;
-            self.transaction.data_bytes = 0;
+            this.state = states.DATA;
+            this.transaction.data_bytes = 0;
         });
     }
     accumulate_data (line) {
-        const self = this;
 
         this.transaction.data_bytes += line.length;
 
@@ -1585,7 +1551,7 @@ class Connection {
             line[0] === 0x2e &&
             line[1] === 0x0d &&
             line[2] === 0x0a) {
-            self.data_done();
+            this.data_done();
             return;
         }
 
@@ -1595,20 +1561,20 @@ class Connection {
             line[1] === 0x0a) {
             this.lognotice('Client sent bare line-feed - .\\n rather than .\\r\\n');
             this.respond(451, "Bare line-feed; see http://haraka.github.io/barelf/", () => {
-                self.reset_transaction();
+                this.reset_transaction();
             });
             return;
         }
 
         // Stop accumulating data as we're going to reject at dot.
-        if (this.max_bytes && this.transaction.data_bytes > this.max_bytes) {
+        if (cfg.max.bytes && this.transaction.data_bytes > cfg.max.bytes) {
             return;
         }
 
-        if (this.transaction.mime_part_count >= this.max_mime_parts) {
+        if (this.transaction.mime_part_count >= cfg.max.mime_parts) {
             this.logcrit("Possible DoS attempt - too many MIME parts");
             this.respond(554, "Transaction failed due to too many MIME parts", () => {
-                self.disconnect();
+                this.disconnect();
             });
             return;
         }
@@ -1616,31 +1582,30 @@ class Connection {
         this.transaction.add_data(line);
     }
     data_done () {
-        const self = this;
         this.pause();
         this.totalbytes += this.transaction.data_bytes;
 
         // Check message size limit
-        if (this.max_bytes && this.transaction.data_bytes > this.max_bytes) {
-            this.lognotice(`Incoming message exceeded databytes size of ${this.max_bytes}`);
+        if (cfg.max.bytes && this.transaction.data_bytes > cfg.max.bytes) {
+            this.lognotice(`Incoming message exceeded max size of ${cfg.max.bytes}`);
             return plugins.run_hooks('max_data_exceeded', this);
         }
 
         // Check max received headers count
-        if (this.transaction.header.get_all('received').length > this.cfg.headers.max_received) {
+        if (this.transaction.header.get_all('received').length > cfg.headers.max_received) {
             this.logerror("Incoming message had too many Received headers");
             this.respond(550, "Too many received headers - possible mail loop", () => {
-                self.reset_transaction();
+                this.reset_transaction();
             });
             return;
         }
 
         // Warn if we hit the maximum parsed header lines limit
-        if (this.transaction.header_lines.length >= this.cfg.headers.max_lines) {
-            this.logwarn(`Incoming message reached maximum parsing limit of ${this.cfg.headers.max_lines} header lines`);
+        if (this.transaction.header_lines.length >= cfg.headers.max_lines) {
+            this.logwarn(`Incoming message reached maximum parsing limit of ${cfg.headers.max_lines} header lines`);
         }
 
-        if (this.cfg.headers.clean_auth_results) {
+        if (cfg.headers.clean_auth_results) {
             this.auth_results_clean();   // rename old A-R headers
         }
         const ar_field = this.auth_results();  // assemble new one
@@ -1651,12 +1616,12 @@ class Connection {
         this.transaction.end_data(() => {
             // As this will be called asynchronously,
             // make sure we still have a transaction.
-            if (!self.transaction) return;
+            if (!this.transaction) return;
             // Record the start time of this hook as we can't take too long
             // as the client will typically hang up after 2 to 3 minutes
             // despite the RFC mandating that 10 minutes should be allowed.
-            self.transaction.data_post_start = Date.now();
-            plugins.run_hooks('data_post', self);
+            this.transaction.data_post_start = Date.now();
+            plugins.run_hooks('data_post', this);
         });
     }
     data_post_respond (retval, msg) {
@@ -1679,34 +1644,33 @@ class Connection {
             this.transaction.remove_header('Authentication-Results');
             this.transaction.add_leading_header('Authentication-Results', ar_field);
         }
-        const self = this;
         switch (retval) {
             case constants.deny:
                 this.respond(550, msg || "Message denied", () => {
-                    self.msg_count.reject++;
-                    self.transaction.msg_status = 'rejected';
-                    self.reset_transaction(() => self.resume());
+                    this.msg_count.reject++;
+                    this.transaction.msg_status = 'rejected';
+                    this.reset_transaction(() => this.resume());
                 });
                 break;
             case constants.denydisconnect:
                 this.respond(550, msg || "Message denied",() => {
-                    self.msg_count.reject++;
-                    self.transaction.msg_status = 'rejected';
-                    self.disconnect();
+                    this.msg_count.reject++;
+                    this.transaction.msg_status = 'rejected';
+                    this.disconnect();
                 });
                 break;
             case constants.denysoft:
                 this.respond(450, msg || "Message denied temporarily", () =>  {
-                    self.msg_count.tempfail++;
-                    self.transaction.msg_status = 'deferred';
-                    self.reset_transaction(() => self.resume());
+                    this.msg_count.tempfail++;
+                    this.transaction.msg_status = 'deferred';
+                    this.reset_transaction(() => this.resume());
                 });
                 break;
             case constants.denysoftdisconnect:
                 this.respond(450, msg || "Message denied temporarily",() => {
-                    self.msg_count.tempfail++;
-                    self.transaction.msg_status = 'deferred';
-                    self.disconnect();
+                    this.msg_count.tempfail++;
+                    this.transaction.msg_status = 'deferred';
+                    this.disconnect();
                 });
                 break;
             default:
@@ -1719,14 +1683,18 @@ class Connection {
         }
     }
     max_data_exceeded_respond (retval, msg) {
-        const self = this;
         // TODO: Maybe figure out what to do with other return codes
         this.respond(retval === constants.denysoft ? 450 : 550, "Message too big!", () => {
-            self.reset_transaction();
+            this.reset_transaction();
         });
     }
     queue_msg (retval, msg) {
-        if (msg) return msg;
+        if (msg) {
+            if (typeof msg === 'object' && msg.constructor.name === 'DSN') {
+                return msg.reply
+            }
+            return msg;
+        }
 
         switch (retval) {
             case constants.ok:
@@ -1761,8 +1729,8 @@ class Connection {
         }
     }
     queue_outbound_respond (retval, msg) {
-        const self = this;
-        if (!msg) msg = this.queue_msg(retval, msg) || 'Message Queued';
+        if (this.remote.closed) return;
+        msg = this.queue_msg(retval, msg) || 'Message Queued';
         this.store_queue_result(retval, msg);
         msg = `${msg} (${this.transaction.uuid})`;
         if (retval !== constants.ok) {
@@ -1780,57 +1748,57 @@ class Connection {
                 break;
             case constants.deny:
                 this.respond(550, msg, () => {
-                    self.msg_count.reject++;
-                    self.transaction.msg_status = 'rejected';
-                    self.reset_transaction(() => self.resume());
+                    this.msg_count.reject++;
+                    this.transaction.msg_status = 'rejected';
+                    this.reset_transaction(() => this.resume());
                 });
                 break;
             case constants.denydisconnect:
                 this.respond(550, msg, () => {
-                    self.msg_count.reject++;
-                    self.transaction.msg_status = 'rejected';
-                    self.disconnect();
+                    this.msg_count.reject++;
+                    this.transaction.msg_status = 'rejected';
+                    this.disconnect();
                 });
                 break;
             case constants.denysoft:
                 this.respond(450, msg, () => {
-                    self.msg_count.tempfail++;
-                    self.transaction.msg_status = 'deferred';
-                    self.reset_transaction(() => self.resume());
+                    this.msg_count.tempfail++;
+                    this.transaction.msg_status = 'deferred';
+                    this.reset_transaction(() => this.resume());
                 });
                 break;
             case constants.denysoftdisconnect:
                 this.respond(450, msg, () => {
-                    self.msg_count.tempfail++;
-                    self.transaction.msg_status = 'deferred';
-                    self.disconnect();
+                    this.msg_count.tempfail++;
+                    this.transaction.msg_status = 'deferred';
+                    this.disconnect();
                 });
                 break;
             default:
-                outbound.send_email(this.transaction, (retval2, msg2) => {
-                    if (!msg2) msg2 = self.queue_msg(retval2, msg);
+                outbound.send_trans_email(this.transaction, (retval2, msg2) => {
+                    if (!msg2) msg2 = this.queue_msg(retval2, msg);
                     switch (retval2) {
                         case constants.ok:
-                            if (!msg2) msg2 = self.queue_msg(retval2, msg2);
-                            plugins.run_hooks('queue_ok', self, msg2);
+                            if (!msg2) msg2 = this.queue_msg(retval2, msg2);
+                            plugins.run_hooks('queue_ok', this, msg2);
                             break;
                         case constants.deny:
-                            if (!msg2) msg2 = self.queue_msg(retval2, msg2);
-                            self.respond(550, msg2, () => {
-                                self.msg_count.reject++;
-                                self.transaction.msg_status = 'rejected';
-                                self.reset_transaction(() => {
-                                    self.resume();
+                            if (!msg2) msg2 = this.queue_msg(retval2, msg2);
+                            this.respond(550, msg2, () => {
+                                this.msg_count.reject++;
+                                this.transaction.msg_status = 'rejected';
+                                this.reset_transaction(() => {
+                                    this.resume();
                                 });
                             });
                             break;
                         default:
-                            self.logerror(`Unrecognized response from outbound layer: ${retval2} : ${msg2}`);
-                            self.respond(550, msg2 || "Internal Server Error", () => {
-                                self.msg_count.reject++;
-                                self.transaction.msg_status = 'rejected';
-                                self.reset_transaction(() => {
-                                    self.resume();
+                            this.logerror(`Unrecognized response from outbound layer: ${retval2} : ${msg2}`);
+                            this.respond(550, msg2 || "Internal Server Error", () => {
+                                this.msg_count.reject++;
+                                this.transaction.msg_status = 'rejected';
+                                this.reset_transaction(() => {
+                                    this.resume();
                                 });
                             });
                     }
@@ -1838,8 +1806,7 @@ class Connection {
         }
     }
     queue_respond (retval, msg) {
-        const self = this;
-        if (!msg) msg = this.queue_msg(retval, msg);
+        msg = this.queue_msg(retval, msg);
         this.store_queue_result(retval, msg);
         msg = `${msg} (${this.transaction.uuid})`;
 
@@ -1858,44 +1825,43 @@ class Connection {
                 break;
             case constants.deny:
                 this.respond(550, msg, () => {
-                    self.msg_count.reject++;
-                    self.transaction.msg_status = 'rejected';
-                    self.reset_transaction(() =>  self.resume());
+                    this.msg_count.reject++;
+                    this.transaction.msg_status = 'rejected';
+                    this.reset_transaction(() =>  this.resume());
                 });
                 break;
             case constants.denydisconnect:
                 this.respond(550, msg, () => {
-                    self.msg_count.reject++;
-                    self.transaction.msg_status = 'rejected';
-                    self.disconnect();
+                    this.msg_count.reject++;
+                    this.transaction.msg_status = 'rejected';
+                    this.disconnect();
                 });
                 break;
             case constants.denysoft:
                 this.respond(450, msg, () => {
-                    self.msg_count.tempfail++;
-                    self.transaction.msg_status = 'deferred';
-                    self.reset_transaction(() => self.resume());
+                    this.msg_count.tempfail++;
+                    this.transaction.msg_status = 'deferred';
+                    this.reset_transaction(() => this.resume());
                 });
                 break;
             case constants.denysoftdisconnect:
                 this.respond(450, msg, () => {
-                    self.msg_count.tempfail++;
-                    self.transaction.msg_status = 'deferred';
-                    self.disconnect();
+                    this.msg_count.tempfail++;
+                    this.transaction.msg_status = 'deferred';
+                    this.disconnect();
                 });
                 break;
             default:
                 if (!msg) msg = 'Queuing declined or disabled, try later';
                 this.respond(451, msg, () => {
-                    self.msg_count.tempfail++;
-                    self.transaction.msg_status = 'deferred';
-                    self.reset_transaction(() => self.resume());
+                    this.msg_count.tempfail++;
+                    this.transaction.msg_status = 'deferred';
+                    this.reset_transaction(() => this.resume());
                 });
                 break;
         }
     }
     queue_ok_respond (retval, msg, params) {
-        const self = this;
         // This hook is common to both hook_queue and hook_queue_outbound
         // retval and msg are ignored in this hook so we always log OK
         this.lognotice(
@@ -1907,9 +1873,9 @@ class Connection {
         );
 
         this.respond(250, params, () => {
-            self.msg_count.accept++;
-            if (self.transaction) self.transaction.msg_status = 'accepted';
-            self.reset_transaction(() => self.resume());
+            this.msg_count.accept++;
+            if (this.transaction) this.transaction.msg_status = 'accepted';
+            this.reset_transaction(() => this.resume());
         });
     }
 }
@@ -1920,17 +1886,4 @@ exports.createConnection = (client, server, cfg) => {
     return new Connection(client, server, cfg);
 }
 
-// add logger methods to Connection:
-for (const key in logger) {
-    if (!/^log\w/.test(key)) continue;
-    Connection.prototype[key] = (function (level) {
-        return function () {
-            // pass the connection instance to logger
-            const args = [ this ];
-            for (let i=0, l=arguments.length; i<l; i++) {
-                args.push(arguments[i]);
-            }
-            logger[level].apply(logger, args);
-        };
-    })(key);
-}
+logger.add_log_methods(Connection)

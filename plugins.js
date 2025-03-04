@@ -2,9 +2,9 @@
 // load all defined plugins
 
 // node built-ins
-const fs          = require('fs');
-const path        = require('path');
-const vm          = require('vm');
+const fs          = require('node:fs');
+const path        = require('node:path');
+const vm          = require('node:vm');
 
 // npm modules
 exports.config    = require('haraka-config');
@@ -39,7 +39,6 @@ class Plugin {
     }
 
     _get_plugin_path () {
-        const plugin = this;
         /* From https://github.com/haraka/Haraka/pull/1278#issuecomment-168856528
         In Development mode, or install via a plain "git clone":
 
@@ -57,9 +56,9 @@ class Plugin {
             Plugin in <core_haraka_dir>/node_modules.
         */
 
-        plugin.hasPackageJson = false;
-        const name = plugin.name.startsWith('haraka-plugin-') ? plugin.name.substr(14) : plugin.name;
-        if (plugin.name !== name) plugin.name = name;
+        this.hasPackageJson = false;
+        const name = this.name.startsWith('haraka-plugin-') ? this.name.substr(14) : this.name;
+        if (this.name !== name) this.name = name;
 
         let paths = [];
         if (process.env.HARAKA) {
@@ -75,17 +74,17 @@ class Plugin {
 
         // development mode
         paths = paths.concat(plugin_search_paths(__dirname, name));
-        paths.forEach(pp => {
-            if (plugin.plugin_path) return;
+        for (const pp of paths) {
+            if (this.plugin_path) continue;
             try {
                 fs.statSync(pp);
-                plugin.plugin_path = pp;
+                this.plugin_path = pp;
                 if (path.basename(pp) === 'package.json') {
-                    plugin.hasPackageJson = true;
+                    this.hasPackageJson = true;
                 }
             }
             catch (ignore) {}
-        });
+        }
     }
 
     _get_config () {
@@ -129,8 +128,7 @@ class Plugin {
         this.hooks[hook_name] = this.hooks[hook_name] || [];
         this.hooks[hook_name].push(method_name);
 
-        logger.logdebug(`registered hook ${hook_name} to ${this.name}.` +
-                        `${method_name} priority ${priority}`);
+        plugins.logdebug(`registered hook ${hook_name} to ${this.name}.${method_name} priority ${priority}`);
     }
 
     register () {} // noop
@@ -141,12 +139,6 @@ class Plugin {
             if (!this[method]) {
                 this[method] = parent_plugin[method];
             }
-            // else if (method == 'shutdown') {
-            //     Method is in this module, so it exists in the plugin
-            //     if (!this.hasOwnProperty('shutdown')) {
-            //         this[method] = parent_plugin[method];
-            //     }
-            // }
         }
         if (parent_plugin.register) {
             parent_plugin.register.call(this);
@@ -155,9 +147,8 @@ class Plugin {
     }
 
     _make_custom_require () {
-        const plugin = this;
         return module => {
-            if (plugin.hasPackageJson) {
+            if (this.hasPackageJson) {
                 const mod = require(module);
                 constants.import(global);
                 global.server = plugins.server;
@@ -165,7 +156,7 @@ class Plugin {
             }
 
             if (module === './config') {
-                return plugin.config;
+                return this.config;
             }
 
             if (!/^\./.test(module)) {
@@ -177,14 +168,13 @@ class Plugin {
                 return require(module);
             }
 
-            return require(path.join(path.dirname(plugin.plugin_path), module));
+            return require(path.join(path.dirname(this.plugin_path), module));
         };
     }
 
     _get_code (pp) {
-        const plugin = this;
 
-        if (plugin.hasPackageJson) {
+        if (this.hasPackageJson) {
             let packageDir = path.dirname(pp);
             if (/^win(32|64)/.test(process.platform)) {
                 // escape the c:\path\back\slashes else they disappear
@@ -198,25 +188,24 @@ class Plugin {
         }
         catch (err) {
             if (exports.config.get('smtp.ini').main.ignore_bad_plugins) {
-                logger.logcrit(`Loading plugin ${plugin.name} failed: ${err}`);
+                plugins.logcrit(`Loading ${this.name} failed: ${err}`);
                 return;
             }
-            throw `Loading plugin ${plugin.name} failed: ${err}`;
+            throw `Loading plugin ${this.name} failed: ${err}`;
         }
     }
 
     _compile () {
-        const plugin = this;
 
-        const pp = plugin.plugin_path;
-        const code = plugin._get_code(pp);
+        const pp = this.plugin_path;
+        const code = this._get_code(pp);
         if (!code) return;
 
         const sandbox = {
-            require: plugin._make_custom_require(),
+            require: this._make_custom_require(),
             __filename: pp,
             __dirname:  path.dirname(pp),
-            exports: plugin,
+            exports: this,
             setTimeout,
             clearTimeout,
             setInterval,
@@ -227,7 +216,7 @@ class Plugin {
             server: plugins.server,
             setImmediate
         };
-        if (plugin.hasPackageJson) {
+        if (this.hasPackageJson) {
             delete sandbox.__filename;
         }
         constants.import(sandbox);
@@ -235,16 +224,13 @@ class Plugin {
             vm.runInNewContext(code, sandbox, pp);
         }
         catch (err) {
-            logger.logcrit(`Compiling plugin: ${plugin.name} failed`);
+            plugins.logcrit(`compiling '${this.name}' failed`);
             if (exports.config.get('smtp.ini').main.ignore_bad_plugins) {
-                logger.logcrit(`Loading plugin ${plugin.name} failed: `,
-                    `${err.message} - will skip this plugin and continue`);
+                plugins.logcrit(`Loading '${this.name}' failed: ${err.message} - skipping`);
                 return;
             }
             throw err; // default is to re-throw and stop Haraka
         }
-
-        return plugin;
     }
 }
 
@@ -258,7 +244,7 @@ exports.shutdown_plugins = () => {
 
 process.on('message', msg => {
     if (msg.event && msg.event == 'plugins.shutdown') {
-        logger.loginfo("[plugins] Shutting down plugins");
+        plugins.loginfo("Shutting down");
         exports.shutdown_plugins();
     }
 });
@@ -274,39 +260,28 @@ function plugin_search_paths (prefix, name) {
 function get_timeout (name) {
     let timeout = parseFloat((exports.config.get(`${name}.timeout`)));
     if (isNaN(timeout)) {
-        logger.logdebug(`no timeout in ${name}.timeout`);
+        plugins.logdebug(`no timeout in ${name}.timeout`);
         timeout = parseFloat(exports.config.get('plugin_timeout'));
     }
     if (isNaN(timeout)) {
-        logger.logdebug('no timeout in plugin_timeout');
+        plugins.logdebug('no timeout in plugin_timeout');
         timeout = 30;
     }
 
-    logger.logdebug(`plugin ${name} timeout is: ${timeout}s`);
+    plugins.logdebug(`plugin ${name} timeout is: ${timeout}s`);
     return timeout;
 }
 
-// copy logger methods into Plugin:
-for (const key in logger) {
-    if (!/^log\w/.test(key)) continue;
-    // console.log(`adding Plugin.${key} method`);
-    Plugin.prototype[key] = (function (lev) {
-        return function () {
-            const args = [this];
-            for (let i=0, l=arguments.length; i<l; i++) {
-                args.push(arguments[i]);
-            }
-            logger[lev].apply(logger, args);
-        };
-    })(key);
-}
+logger.add_log_methods(Plugin)
 
 const plugins = exports;
+
+logger.add_log_methods(plugins, 'plugins')
 
 plugins.Plugin = Plugin;
 
 plugins.load_plugins = override => {
-    logger.loginfo('Loading plugins');
+    plugins.logdebug('Loading');
     let plugin_list;
     if (override) {
         if (!Array.isArray(override)) override = [ override ];
@@ -316,23 +291,21 @@ plugins.load_plugins = override => {
         plugin_list = exports.config.get('plugins', 'list');
     }
 
-    plugin_list.forEach(plugin => {
+    for (let plugin of plugin_list) {
         if (plugin.startsWith('haraka-plugin-')) plugin = plugin.substr(14)
         if (plugins.deprecated[plugin]) {
-            logger.lognotice(`the plugin ${plugin} has been replaced by '${plugins.deprecated[plugin]}'. Please update config/plugins`)
+            plugins.lognotice(`${plugin} has been replaced by '${plugins.deprecated[plugin]}'. Please update config/plugins`)
             plugins.load_plugin(plugins.deprecated[plugin]);
         }
         else {
             plugins.load_plugin(plugin);
         }
-    });
+    }
 
     plugins.plugin_list = Object.keys(plugins.registered_plugins);
 
     // Sort registered_hooks by priority
-    const hooks = Object.keys(plugins.registered_hooks);
-    for (let h=0; h<hooks.length; h++) {
-        const hook = hooks[h];
+    for (const hook of Object.keys(plugins.registered_hooks)) {
         plugins.registered_hooks[hook].sort((a, b) => {
             if (a.priority < b.priority) return -1;
             if (a.priority > b.priority) return 1;
@@ -348,14 +321,22 @@ plugins.load_plugins = override => {
 }
 
 plugins.deprecated = {
+    'auth/auth_ldap'      : 'auth-ldap',
+    'backscatterer'       : 'dns-list',
     'connect.asn'         : 'asn',
     'connect.fcrdns'      : 'fcrdns',
     'connect.geoip'       : 'geoip',
+    'connect.p0f'         : 'p0f',
     'connect.rdns_access' : 'access',
     'data.nomsgid'        : 'headers',
     'data.noreceived'     : 'headers',
     'data.rfc5322_header_checks': 'headers',
     'data.headers'        : 'headers',
+    'dkim_sign'           : 'dkim',
+    'dkim_verify'         : 'dkim',
+    'data.uribl'          : 'uribl',
+    'dnsbl'               : 'dns-list',
+    'dnswl'               : 'dns-list',
     'log.syslog'          : 'syslog',
     'mail_from.access'    : 'access',
     'mail_from.blocklist' : 'access',
@@ -364,14 +345,17 @@ plugins.deprecated = {
     'rate_limit'          : 'limit',
     'rcpt_to.access'      : 'access',
     'rcpt_to.blocklist'   : 'access',
+    'rcpt_to.ldap'        : 'rcpt-ldap',
+    'rcpt_to.max_count'   : 'limit',
     'rcpt_to.qmail_deliverable' : 'qmail-deliverable',
     'rdns.regexp'         : 'access',
     'relay_acl'           : 'relay',
+    'relay_all'           : 'relay',
     'relay_force_routing' : 'relay',
 }
 
 plugins.load_plugin = name => {
-    logger.loginfo(`Loading plugin: ${name}`);
+    plugins.loginfo(`loading ${name}`);
 
     const plugin = plugins._load_and_compile_plugin(name);
     if (plugin) {
@@ -379,7 +363,6 @@ plugins.load_plugin = name => {
     }
 
     plugins.registered_plugins[name] = plugin;
-    return plugin;
 }
 
 // Set in server.js; initialized to empty object
@@ -391,7 +374,7 @@ plugins._load_and_compile_plugin = name => {
     if (!plugin.plugin_path) {
         const err = `Loading plugin ${plugin.name} failed: No plugin with this name found`;
         if (exports.config.get('smtp.ini').main.ignore_bad_plugins) {
-            logger.logcrit(err);
+            plugins.logcrit(err);
             return;
         }
         throw err;
@@ -410,8 +393,6 @@ plugins._register_plugin = plugin => {
             plugin.register_hook(result[1], method);
         }
     }
-
-    return plugin;
 }
 
 plugins.run_hooks = (hook, object, params) => {
@@ -439,8 +420,7 @@ plugins.run_hooks = (hook, object, params) => {
     object.hooks_to_run = [];
 
     if (plugins.registered_hooks[hook]) {
-        for (let i=0; i<plugins.registered_hooks[hook].length; i++) {
-            const item = plugins.registered_hooks[hook][i];
+        for (const item of plugins.registered_hooks[hook]) {
             const plugin = plugins.registered_plugins[item.plugin];
             object.hooks_to_run.push([plugin, item.method]);
         }
@@ -500,10 +480,8 @@ plugins.run_next_hook = (hook, object, params) => {
 
         const respond_method = `${hook}_respond`;
         if (item && is_deny_retval(retval) && hook.substr(0,5) !== 'init_') {
-            object.deny_respond =
-                get_denyfn(object, hook, params, retval, msg, respond_method);
-            plugins.run_hooks('deny', object,
-                [retval, msg, item[0].name, item[1], params, hook]);
+            object.deny_respond = get_denyfn(object, hook, params, retval, msg, respond_method);
+            plugins.run_hooks('deny', object, [retval, msg, item[0].name, item[1], params, hook]);
         }
         else {
             object.hooks_to_run = [];
@@ -529,7 +507,7 @@ plugins.run_next_hook = (hook, object, params) => {
         object.logdebug(`running ${hook} hook in ${item[0].name} plugin`);
     }
 
-    if (object.transaction && object.transaction.notes.skip_plugins.includes(item[0].name)) {
+    if (object.transaction?.notes.skip_plugins.includes(item[0].name)) {
         object.logdebug(`skipping ${item[0].name}_${hook} by request in notes`);
         return callback();
     }
@@ -583,9 +561,23 @@ function log_run_item (item, hook, retval, object, params, msg) {
             'function'  :  item[1],
             'params'    :  ((params) ? ((typeof params === 'string') ? params : params[0]) : ''),
             'retval'    : constants.translate(retval),
-            'msg'       :  ((msg) ? msg : ''),
+            'msg'       :  sanitize(msg),
         });
     }
+}
+
+function sanitize (msg) {
+    if (!msg) return ''
+    if (typeof msg === 'string') return msg
+    if (typeof msg === 'object') {
+        if (msg.constructor.name === 'DSN') return msg.reply
+        const sanitized = { ...msg }; // copy the message
+        for (const priv of ['password','auth_pass']) {
+            delete sanitized[priv]
+        }
+        return JSON.stringify(sanitized)
+    }
+    logger.logerror(`what is ${msg} (typeof ${typeof msg})?`)
 }
 
 function is_deny_retval (val) {
